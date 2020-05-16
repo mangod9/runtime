@@ -1839,7 +1839,7 @@ void CodeGen::genCodeForLclVar(GenTreeLclVar* tree)
     // If this is a register candidate that has been spilled, genConsumeReg() will
     // reload it at the point of use.  Otherwise, if it's not in a register, we load it here.
 
-    if (!isRegCandidate && !(tree->gtFlags & GTF_SPILLED))
+    if (!isRegCandidate && !tree->IsMultiReg() && !(tree->gtFlags & GTF_SPILLED))
     {
         // targetType must be a normal scalar type and not a TYP_STRUCT
         assert(targetType != TYP_STRUCT);
@@ -1929,7 +1929,7 @@ void CodeGen::genCodeForStoreLclVar(GenTreeLclVar* tree)
     // case is handled separately.
     if (data->gtSkipReloadOrCopy()->IsMultiRegCall())
     {
-        genMultiRegCallStoreToLocal(tree);
+        genMultiRegStoreToLocal(tree);
     }
     else
     {
@@ -1953,17 +1953,31 @@ void CodeGen::genCodeForStoreLclVar(GenTreeLclVar* tree)
         genConsumeRegs(data);
 
         regNumber dataReg = REG_NA;
-        if (data->isContainedIntOrIImmed())
+        if (data->isContained())
         {
             // This is only possible for a zero-init.
-            assert(data->IsIntegralConst(0));
+            assert(data->IsIntegralConst(0) || data->IsSIMDZero());
 
             if (varTypeIsSIMD(targetType))
             {
-                assert(targetType == TYP_SIMD16);
-                assert(targetReg != REG_NA);
-                emit->emitIns_R_I(INS_movi, EA_16BYTE, targetReg, 0x00, INS_OPTS_16B);
-                genProduceReg(tree);
+                if (targetReg != REG_NA)
+                {
+                    emit->emitIns_R_I(INS_movi, emitActualTypeSize(targetType), targetReg, 0x00, INS_OPTS_16B);
+                    genProduceReg(tree);
+                }
+                else
+                {
+                    if (targetType == TYP_SIMD16)
+                    {
+                        GetEmitter()->emitIns_S_S_R_R(INS_stp, EA_8BYTE, EA_8BYTE, REG_ZR, REG_ZR, varNum, 0);
+                    }
+                    else
+                    {
+                        assert(targetType == TYP_SIMD8);
+                        GetEmitter()->emitIns_S_R(INS_str, EA_8BYTE, REG_ZR, varNum, 0);
+                    }
+                    genUpdateLife(tree);
+                }
                 return;
             }
 
@@ -2665,8 +2679,8 @@ void CodeGen::genCodeForCpObj(GenTreeObj* cpObjNode)
 
     if (cpObjNode->gtFlags & GTF_BLK_VOLATILE)
     {
-        // issue a INS_BARRIER_ISHLD after a volatile CpObj operation
-        instGen_MemoryBarrier(INS_BARRIER_ISHLD);
+        // issue a load barrier after a volatile CpObj operation
+        instGen_MemoryBarrier(BARRIER_LOAD_ONLY);
     }
 
     // Clear the gcInfo for REG_WRITE_BARRIER_SRC_BYREF and REG_WRITE_BARRIER_DST_BYREF.
@@ -2775,7 +2789,7 @@ void CodeGen::genLockedInstructions(GenTreeOp* treeNode)
                 assert(!"Unexpected treeNode->gtOper");
         }
 
-        instGen_MemoryBarrier(INS_BARRIER_ISH);
+        instGen_MemoryBarrier();
     }
     else
     {
@@ -2855,7 +2869,7 @@ void CodeGen::genLockedInstructions(GenTreeOp* treeNode)
 
         GetEmitter()->emitIns_J_R(INS_cbnz, EA_4BYTE, labelRetry, exResultReg);
 
-        instGen_MemoryBarrier(INS_BARRIER_ISH);
+        instGen_MemoryBarrier();
 
         gcInfo.gcMarkRegSetNpt(addr->gtGetRegMask());
     }
@@ -2904,7 +2918,7 @@ void CodeGen::genCodeForCmpXchg(GenTreeCmpXchg* treeNode)
         }
         GetEmitter()->emitIns_R_R_R(INS_casal, dataSize, targetReg, dataReg, addrReg);
 
-        instGen_MemoryBarrier(INS_BARRIER_ISH);
+        instGen_MemoryBarrier();
     }
     else
     {
@@ -2984,7 +2998,7 @@ void CodeGen::genCodeForCmpXchg(GenTreeCmpXchg* treeNode)
 
         genDefineTempLabel(labelCompareFail);
 
-        instGen_MemoryBarrier(INS_BARRIER_ISH);
+        instGen_MemoryBarrier();
 
         gcInfo.gcMarkRegSetNpt(addr->gtGetRegMask());
     }
@@ -5019,7 +5033,20 @@ void CodeGen::genStoreLclTypeSIMD12(GenTree* treeNode)
     }
 
     GenTree* op1 = treeNode->AsOp()->gtOp1;
-    assert(!op1->isContained());
+
+    if (op1->isContained())
+    {
+        // This is only possible for a zero-init.
+        assert(op1->IsIntegralConst(0) || op1->IsSIMDZero());
+
+        // store lower 8 bytes
+        GetEmitter()->emitIns_S_R(ins_Store(TYP_DOUBLE), EA_8BYTE, REG_ZR, varNum, offs);
+
+        // Store upper 4 bytes
+        GetEmitter()->emitIns_S_R(ins_Store(TYP_FLOAT), EA_4BYTE, REG_ZR, varNum, offs + 8);
+
+        return;
+    }
     regNumber operandReg = genConsumeReg(op1);
 
     // Need an addtional integer register to extract upper 4 bytes from data.
@@ -5433,6 +5460,38 @@ void CodeGen::genArm64EmitterUnitTests()
     theEmitter->emitIns_R_R(INS_ld4r, EA_16BYTE, REG_V25, REG_R29, INS_OPTS_4S);
     theEmitter->emitIns_R_R(INS_ld4r, EA_8BYTE, REG_V30, REG_R2, INS_OPTS_1D);
     theEmitter->emitIns_R_R(INS_ld4r, EA_16BYTE, REG_V3, REG_R7, INS_OPTS_2D);
+
+    // tbl Vd, {Vt}, Vm
+    theEmitter->emitIns_R_R_R(INS_tbl, EA_8BYTE, REG_V0, REG_V1, REG_V6, INS_OPTS_8B);
+    theEmitter->emitIns_R_R_R(INS_tbl, EA_8BYTE, REG_V0, REG_V1, REG_V6, INS_OPTS_16B);
+
+    // tbx Vd, {Vt}, Vm
+    theEmitter->emitIns_R_R_R(INS_tbx, EA_8BYTE, REG_V0, REG_V1, REG_V6, INS_OPTS_8B);
+    theEmitter->emitIns_R_R_R(INS_tbx, EA_8BYTE, REG_V0, REG_V1, REG_V6, INS_OPTS_16B);
+
+    // tbl Vd, {Vt, Vt2}, Vm
+    theEmitter->emitIns_R_R_R(INS_tbl_2regs, EA_8BYTE, REG_V0, REG_V1, REG_V6, INS_OPTS_8B);
+    theEmitter->emitIns_R_R_R(INS_tbl_2regs, EA_8BYTE, REG_V0, REG_V1, REG_V6, INS_OPTS_16B);
+
+    // tbx Vd, {Vt, Vt2}, Vm
+    theEmitter->emitIns_R_R_R(INS_tbx_2regs, EA_8BYTE, REG_V0, REG_V1, REG_V6, INS_OPTS_8B);
+    theEmitter->emitIns_R_R_R(INS_tbx_2regs, EA_8BYTE, REG_V0, REG_V1, REG_V6, INS_OPTS_16B);
+
+    // tbl Vd, {Vt, Vt2, Vt3}, Vm
+    theEmitter->emitIns_R_R_R(INS_tbl_3regs, EA_8BYTE, REG_V0, REG_V1, REG_V6, INS_OPTS_8B);
+    theEmitter->emitIns_R_R_R(INS_tbl_3regs, EA_8BYTE, REG_V0, REG_V1, REG_V6, INS_OPTS_16B);
+
+    // tbx Vd, {Vt, Vt2, Vt3}, Vm
+    theEmitter->emitIns_R_R_R(INS_tbx_3regs, EA_8BYTE, REG_V0, REG_V1, REG_V6, INS_OPTS_8B);
+    theEmitter->emitIns_R_R_R(INS_tbx_3regs, EA_8BYTE, REG_V0, REG_V1, REG_V6, INS_OPTS_16B);
+
+    // tbl Vd, {Vt, Vt2, Vt3, Vt4}, Vm
+    theEmitter->emitIns_R_R_R(INS_tbl_4regs, EA_8BYTE, REG_V0, REG_V1, REG_V6, INS_OPTS_8B);
+    theEmitter->emitIns_R_R_R(INS_tbl_4regs, EA_8BYTE, REG_V0, REG_V1, REG_V6, INS_OPTS_16B);
+
+    // tbx Vd, {Vt, Vt2, Vt3, Vt4}, Vm
+    theEmitter->emitIns_R_R_R(INS_tbx_4regs, EA_8BYTE, REG_V0, REG_V1, REG_V6, INS_OPTS_8B);
+    theEmitter->emitIns_R_R_R(INS_tbx_4regs, EA_8BYTE, REG_V0, REG_V1, REG_V6, INS_OPTS_16B);
 
 #endif // ALL_ARM64_EMITTER_UNIT_TESTS
 
@@ -6952,7 +7011,6 @@ void CodeGen::genArm64EmitterUnitTests()
     genDefineTempLabel(genCreateTempLabel());
 
     theEmitter->emitIns_R(INS_br, EA_PTRSIZE, REG_R8);
-    theEmitter->emitIns_R(INS_blr, EA_PTRSIZE, REG_R9);
     theEmitter->emitIns_R(INS_ret, EA_PTRSIZE, REG_R8);
     theEmitter->emitIns_R(INS_ret, EA_PTRSIZE, REG_LR);
 
@@ -7297,6 +7355,10 @@ void CodeGen::genArm64EmitterUnitTests()
     theEmitter->emitIns_R_I(INS_movi, EA_16BYTE, REG_V29, 0x00FFFF0000FFFF00, INS_OPTS_2D);
     theEmitter->emitIns_R_I(INS_movi, EA_8BYTE, REG_V30, 0xFF000000FF000000);
     theEmitter->emitIns_R_I(INS_movi, EA_16BYTE, REG_V31, 0x0, INS_OPTS_2D);
+
+    // We were not encoding immediate of movi that was int.MaxValue or int.MaxValue / 2.
+    theEmitter->emitIns_R_I(INS_movi, EA_8BYTE, REG_V16, 0x7fffffff, INS_OPTS_2S);
+    theEmitter->emitIns_R_I(INS_movi, EA_8BYTE, REG_V16, 0x3fffffff, INS_OPTS_2S);
 
     theEmitter->emitIns_R_I(INS_mvni, EA_8BYTE, REG_V0, 0x0022, INS_OPTS_4H);
     theEmitter->emitIns_R_I(INS_mvni, EA_8BYTE, REG_V1, 0x2200, INS_OPTS_4H); // LSL  8

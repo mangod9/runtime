@@ -649,12 +649,13 @@ void emitter::emitInsSanityCheck(instrDesc* id)
             break;
 
         case IF_DV_2D: // DV_2D   .Q.........iiiii ......nnnnnddddd      Vd Vn[]  (dup - vector)
+            ins      = id->idIns();
             datasize = id->idOpSize();
             assert(isValidVectorDatasize(datasize));
             assert(isValidArrangement(datasize, id->idInsOpt()));
             elemsize = optGetElemsize(id->idInsOpt());
             index    = emitGetInsSC(id);
-            assert(isValidVectorIndex(datasize, elemsize, index));
+            assert((ins == INS_dup) || isValidVectorIndex(datasize, elemsize, index));
             assert(isVectorRegister(id->idReg1()));
             assert(isVectorRegister(id->idReg2()));
             break;
@@ -817,6 +818,22 @@ void emitter::emitInsSanityCheck(instrDesc* id)
             break;
 
         case IF_DV_3C: // DV_3C   .Q.........mmmmm ......nnnnnddddd      Vd Vn Vm   (vector)
+            switch (id->idIns())
+            {
+                case INS_tbl:
+                case INS_tbl_2regs:
+                case INS_tbl_3regs:
+                case INS_tbl_4regs:
+                case INS_tbx:
+                case INS_tbx_2regs:
+                case INS_tbx_3regs:
+                case INS_tbx_4regs:
+                    elemsize = optGetElemsize(id->idInsOpt());
+                    assert(elemsize == EA_1BYTE);
+                    break;
+                default:
+                    break;
+            }
             assert(isValidVectorDatasize(id->idOpSize()));
             assert(isValidArrangement(id->idOpSize(), id->idInsOpt()));
             assert(isVectorRegister(id->idReg1()));
@@ -2848,12 +2865,11 @@ emitter::code_t emitter::emitInsCode(instruction ins, insFormat fmt)
  *         'size' specifies the size of the result (16 or 32 bits)
  */
 
-/*static*/ INT32 emitter::emitDecodeByteShiftedImm(const emitter::byteShiftedImm bsImm, emitAttr size)
+/*static*/ UINT32 emitter::emitDecodeByteShiftedImm(const emitter::byteShiftedImm bsImm, emitAttr size)
 {
     bool     onesShift = (bsImm.immOnes == 1);
-    unsigned bySh      = bsImm.immBY;         // Num Bytes to shift 0,1,2,3
-    INT32    val       = (INT32)bsImm.immVal; // 8-bit immediate
-    INT32    result    = val;
+    unsigned bySh      = bsImm.immBY;          // Num Bytes to shift 0,1,2,3
+    UINT32   result    = (UINT32)bsImm.immVal; // 8-bit immediate
 
     if (bySh > 0)
     {
@@ -3213,15 +3229,16 @@ emitter::code_t emitter::emitInsCode(instruction ins, insFormat fmt)
 }
 
 //------------------------------------------------------------------------
-// insGetLoadStoreRegisterListSize: Returns a size of the register list a given instruction operates on.
+// insGetRegisterListSize: Returns a size of the register list a given instruction operates on.
 //
 // Arguments:
-//   ins - A Load/Store Vector instruction (e.g. ld1 (2 registers), ld1r, st1).
+//   ins - An instruction which uses a register list
+//         (e.g. ld1 (2 registers), ld1r, st1, tbl, tbx).
 //
 // Return value:
 //   A number of consecutive SIMD and floating-point registers the instruction loads to/store from.
 //
-/*static*/ unsigned emitter::insGetLoadStoreRegisterListSize(instruction ins)
+/*static*/ unsigned emitter::insGetRegisterListSize(instruction ins)
 {
     unsigned registerListSize = 0;
 
@@ -3230,6 +3247,8 @@ emitter::code_t emitter::emitInsCode(instruction ins, insFormat fmt)
         case INS_ld1:
         case INS_ld1r:
         case INS_st1:
+        case INS_tbl:
+        case INS_tbx:
             registerListSize = 1;
             break;
 
@@ -3238,6 +3257,8 @@ emitter::code_t emitter::emitInsCode(instruction ins, insFormat fmt)
         case INS_ld2r:
         case INS_st1_2regs:
         case INS_st2:
+        case INS_tbl_2regs:
+        case INS_tbx_2regs:
             registerListSize = 2;
             break;
 
@@ -3246,6 +3267,8 @@ emitter::code_t emitter::emitInsCode(instruction ins, insFormat fmt)
         case INS_ld3r:
         case INS_st1_3regs:
         case INS_st3:
+        case INS_tbl_3regs:
+        case INS_tbx_3regs:
             registerListSize = 3;
             break;
 
@@ -3254,6 +3277,8 @@ emitter::code_t emitter::emitInsCode(instruction ins, insFormat fmt)
         case INS_ld4r:
         case INS_st1_4regs:
         case INS_st4:
+        case INS_tbl_4regs:
+        case INS_tbx_4regs:
             registerListSize = 4;
             break;
 
@@ -5007,12 +5032,17 @@ void emitter::emitIns_R_R_I(
             {
                 if (insOptsAnyArrangement(opt))
                 {
+                    // The size and opt were modified to be based on the
+                    // return type but the immediate is based on the operand
+                    // which can be of a larger size. As such, we don't
+                    // assert the index is valid here and instead do it in
+                    // codegen.
+
                     // Vector operation
                     assert(isValidVectorDatasize(size));
                     assert(isValidArrangement(size, opt));
                     elemsize = optGetElemsize(opt);
                     assert(isValidVectorElemsize(elemsize));
-                    assert(isValidVectorIndex(size, elemsize, imm));
                     assert(opt != INS_OPTS_1D); // Reserved encoding
                     fmt = IF_DV_2D;
                     break;
@@ -5192,7 +5222,7 @@ void emitter::emitIns_R_R_I(
 
             if (insOptsAnyArrangement(opt))
             {
-                registerListSize = insGetLoadStoreRegisterListSize(ins);
+                registerListSize = insGetRegisterListSize(ins);
                 assert(isValidVectorDatasize(size));
                 assert(isValidArrangement(size, opt));
                 assert((size * registerListSize) == imm);
@@ -5226,7 +5256,7 @@ void emitter::emitIns_R_R_I(
             assert(isValidArrangement(size, opt));
 
             elemsize         = optGetElemsize(opt);
-            registerListSize = insGetLoadStoreRegisterListSize(ins);
+            registerListSize = insGetRegisterListSize(ins);
             assert((elemsize * registerListSize) == imm);
 
             // Load single structure and replicate  post-indexed by an immediate
@@ -5676,6 +5706,14 @@ void emitter::emitIns_R_R_R(
         case INS_eor:
         case INS_orr:
         case INS_orn:
+        case INS_tbl:
+        case INS_tbl_2regs:
+        case INS_tbl_3regs:
+        case INS_tbl_4regs:
+        case INS_tbx:
+        case INS_tbx_2regs:
+        case INS_tbx_3regs:
+        case INS_tbx_4regs:
             if (isVectorRegister(reg1))
             {
                 assert(isValidVectorDatasize(size));
@@ -6612,7 +6650,7 @@ void emitter::emitIns_R_R_I_I(
             assert(isValidVectorElemsize(elemsize));
             assert(isValidVectorIndex(EA_16BYTE, elemsize, imm1));
 
-            registerListSize = insGetLoadStoreRegisterListSize(ins);
+            registerListSize = insGetRegisterListSize(ins);
             assert((elemsize * registerListSize) == (unsigned)imm2);
             assert(insOptsPostIndex(opt));
 
@@ -7510,7 +7548,7 @@ void emitter::emitIns_R_C(
             fmt = IF_LARGELDC;
             if (isVectorRegister(reg))
             {
-                assert(isValidScalarDatasize(size));
+                assert(isValidVectorLSDatasize(size));
                 // For vector (float/double) register, we should have an integer address reg to
                 // compute long address which consists of page address and page offset.
                 // For integer constant, this is not needed since the dest reg can be used to
@@ -7523,6 +7561,7 @@ void emitter::emitIns_R_C(
                 assert(isValidGeneralDatasize(size));
             }
             break;
+
         default:
             unreached();
     }
@@ -11884,7 +11923,7 @@ void emitter::emitDispIns(
 
         case IF_LS_2D: // LS_2D   .Q.............. ....ssnnnnnttttt      Vt Rn
         case IF_LS_2E: // LS_2E   .Q.............. ....ssnnnnnttttt      Vt Rn
-            registerListSize = insGetLoadStoreRegisterListSize(id->idIns());
+            registerListSize = insGetRegisterListSize(id->idIns());
             emitDispVectorRegList(id->idReg1(), registerListSize, id->idInsOpt(), true);
 
             if (fmt == IF_LS_2D)
@@ -11903,7 +11942,7 @@ void emitter::emitDispIns(
 
         case IF_LS_2F: // LS_2F   .Q.............. xx.Sssnnnnnttttt      Vt[] Rn
         case IF_LS_2G: // LS_2G   .Q.............. xx.Sssnnnnnttttt      Vt[] Rn
-            registerListSize = insGetLoadStoreRegisterListSize(id->idIns());
+            registerListSize = insGetRegisterListSize(id->idIns());
             elemsize         = id->idOpSize();
             emitDispVectorElemList(id->idReg1(), registerListSize, elemsize, id->idSmallCns(), true);
 
@@ -11967,7 +12006,7 @@ void emitter::emitDispIns(
 
         case IF_LS_3F: // LS_3F   .Q.........mmmmm ....ssnnnnnttttt      Vt Rn Rm
         case IF_LS_3G: // LS_3G   .Q.........mmmmm ...Sssnnnnnttttt      Vt[] Rn Rm
-            registerListSize = insGetLoadStoreRegisterListSize(id->idIns());
+            registerListSize = insGetRegisterListSize(id->idIns());
 
             if (fmt == IF_LS_3F)
             {
@@ -12468,9 +12507,24 @@ void emitter::emitDispIns(
 
         case IF_DV_3C: // DV_3C   .Q.........mmmmm ......nnnnnddddd      Vd Vn Vm  (vector)
             emitDispVectorReg(id->idReg1(), id->idInsOpt(), true);
-            if (ins != INS_mov)
+            switch (ins)
             {
-                emitDispVectorReg(id->idReg2(), id->idInsOpt(), true);
+                case INS_tbl:
+                case INS_tbl_2regs:
+                case INS_tbl_3regs:
+                case INS_tbl_4regs:
+                case INS_tbx:
+                case INS_tbx_2regs:
+                case INS_tbx_3regs:
+                case INS_tbx_4regs:
+                    registerListSize = insGetRegisterListSize(ins);
+                    emitDispVectorRegList(id->idReg2(), registerListSize, INS_OPTS_16B, true);
+                    break;
+                case INS_mov:
+                    break;
+                default:
+                    emitDispVectorReg(id->idReg2(), id->idInsOpt(), true);
+                    break;
             }
             emitDispVectorReg(id->idReg3(), id->idInsOpt(), false);
             break;
@@ -12665,7 +12719,7 @@ void emitter::emitInsLoadStoreOp(instruction ins, emitAttr attr, regNumber dataR
 
     if (addr->isContained())
     {
-        assert(addr->OperGet() == GT_LCL_VAR_ADDR || addr->OperGet() == GT_LEA);
+        assert(addr->OperGet() == GT_CLS_VAR_ADDR || addr->OperGet() == GT_LCL_VAR_ADDR || addr->OperGet() == GT_LEA);
 
         int   offset = 0;
         DWORD lsl    = 0;
@@ -12742,7 +12796,13 @@ void emitter::emitInsLoadStoreOp(instruction ins, emitAttr attr, regNumber dataR
         }
         else // no Index register
         {
-            if (emitIns_valid_imm_for_ldst_offset(offset, emitTypeSize(indir->TypeGet())))
+            if (addr->OperGet() == GT_CLS_VAR_ADDR)
+            {
+                // Get a temp integer register to compute long address.
+                regNumber addrReg = indir->GetSingleTempReg();
+                emitIns_R_C(ins, attr, dataReg, addrReg, addr->AsClsVar()->gtClsVarHnd, 0);
+            }
+            else if (emitIns_valid_imm_for_ldst_offset(offset, emitTypeSize(indir->TypeGet())))
             {
                 // Then load/store dataReg from/to [memBase + offset]
                 emitIns_R_R_I(ins, attr, dataReg, memBase->GetRegNum(), offset);
@@ -14145,9 +14205,48 @@ emitter::insExecutionCharacteristics emitter::getInsExecutionCharacteristics(ins
             }
             break;
 
-        case IF_DV_3C: // mov,and, bic, eor, mov,mvn, orn, bsl, bit, bif (vector)
-            result.insThroughput = PERFSCORE_THROUGHPUT_2X;
-            result.insLatency    = PERFSCORE_LATENCY_1C;
+        case IF_DV_3C: // mov,and, bic, eor, mov,mvn, orn, bsl, bit, bif,
+                       // tbl, tbx (vector)
+            switch (ins)
+            {
+                case INS_tbl:
+                    result.insThroughput = PERFSCORE_THROUGHPUT_2X;
+                    result.insLatency    = PERFSCORE_LATENCY_1C;
+                    break;
+                case INS_tbl_2regs:
+                    result.insThroughput = PERFSCORE_THROUGHPUT_3X;
+                    result.insLatency    = PERFSCORE_LATENCY_2C;
+                    break;
+                case INS_tbl_3regs:
+                    result.insThroughput = PERFSCORE_THROUGHPUT_4X;
+                    result.insLatency    = PERFSCORE_LATENCY_3C;
+                    break;
+                case INS_tbl_4regs:
+                    result.insThroughput = PERFSCORE_THROUGHPUT_3X;
+                    result.insLatency    = PERFSCORE_LATENCY_4C;
+                    break;
+                case INS_tbx:
+                    result.insThroughput = PERFSCORE_THROUGHPUT_3X;
+                    result.insLatency    = PERFSCORE_LATENCY_2C;
+                    break;
+                case INS_tbx_2regs:
+                    result.insThroughput = PERFSCORE_THROUGHPUT_4X;
+                    result.insLatency    = PERFSCORE_LATENCY_3C;
+                    break;
+                case INS_tbx_3regs:
+                    result.insThroughput = PERFSCORE_THROUGHPUT_5X;
+                    result.insLatency    = PERFSCORE_LATENCY_4C;
+                    break;
+                case INS_tbx_4regs:
+                    result.insThroughput = PERFSCORE_THROUGHPUT_6X;
+                    result.insLatency    = PERFSCORE_LATENCY_5C;
+                    break;
+                default:
+                    // All other instructions
+                    result.insThroughput = PERFSCORE_THROUGHPUT_2X;
+                    result.insLatency    = PERFSCORE_LATENCY_1C;
+                    break;
+            }
             break;
 
         case IF_DV_2E: // mov, dup (scalar)
