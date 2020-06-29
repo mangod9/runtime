@@ -38,7 +38,7 @@ The dotnet/runtime repository requires at least Visual Studio 2019 16.6 Preview 
 
 ## CMake
 
-- Install [CMake](http://www.cmake.org/download) for Windows.
+- Install [CMake](https://cmake.org/download) for Windows.
 - Add its location (e.g. C:\Program Files (x86)\CMake\bin) to the PATH environment variable.
   The installation script has a check box to do this, but you can do it yourself after the fact following the instructions at [Adding to the Default PATH variable](#adding-to-the-default-path-variable).
 
@@ -70,6 +70,14 @@ The dotnet/runtime repository requires at least Git 2.22.0.
 While not strictly needed to build or test this repository, having the .NET SDK installed lets you browse solution files in this repository with Visual Studio and use the dotnet.exe command to run .NET applications in the 'normal' way.
 We use this in the [Using Your Build](../testing/using-your-build.md) instructions.
 The minimum required version of the SDK is specified in the [global.json file](https://github.com/dotnet/runtime/blob/master/global.json#L3). [You can find the installers and binaries for nightly builds of .NET SDK here](https://github.com/dotnet/installer#installers-and-binaries).
+
+Alternatively, to avoid modifying your machine state, you can use the repository's locally acquired SDK by passing in the solution to load via the `-vs` switch:
+
+```
+build.cmd -vs System.Text.RegularExpressions
+```
+
+This will set the `DOTNET_ROOT` and `PATH` environment variables to point to the locally acquired SDK under `runtime\.dotnet\` and will launch the Visual Studio instance which is registered for the `sln` extension.
 
 ## Adding to the default PATH variable
 
