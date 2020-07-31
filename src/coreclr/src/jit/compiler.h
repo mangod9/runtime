@@ -2701,6 +2701,8 @@ public:
 
     GenTree* gtNewNullCheck(GenTree* addr, BasicBlock* basicBlock);
 
+    void gtChangeOperToNullCheck(GenTree* tree, BasicBlock* block);
+
     GenTreeArgList* gtNewArgList(GenTree* op);
     GenTreeArgList* gtNewArgList(GenTree* op1, GenTree* op2);
     GenTreeArgList* gtNewArgList(GenTree* op1, GenTree* op2, GenTree* op3);
@@ -4633,6 +4635,8 @@ public:
 
     void fgComputeLifeLIR(VARSET_TP& life, BasicBlock* block, VARSET_VALARG_TP volatileVars);
 
+    bool fgTryRemoveNonLocal(GenTree* node, LIR::Range* blockRange);
+
     bool fgRemoveDeadStore(GenTree**        pTree,
                            LclVarDsc*       varDsc,
                            VARSET_VALARG_TP life,
@@ -4964,7 +4968,7 @@ protected:
 
     // When the flow graph changes, we need to update the block numbers, predecessor lists, reachability sets, and
     // dominators.
-    void fgUpdateChangedFlowGraph();
+    void fgUpdateChangedFlowGraph(bool computeDoms = true);
 
 public:
     // Compute the predecessors of the blocks in the control flow graph.
@@ -6363,7 +6367,12 @@ protected:
                                    // not used for shared const CSE's
     };
 
-    static const size_t s_optCSEhashSize;
+    static const size_t s_optCSEhashSizeInitial;
+    static const size_t s_optCSEhashGrowthFactor;
+    static const size_t s_optCSEhashBucketSize;
+    size_t              optCSEhashSize;                 // The current size of hashtable
+    size_t              optCSEhashCount;                // Number of entries in hashtable
+    size_t              optCSEhashMaxCountBeforeResize; // Number of entries before resize
     CSEdsc**            optCSEhash;
     CSEdsc**            optCSEtab;
 
