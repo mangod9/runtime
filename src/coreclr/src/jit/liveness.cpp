@@ -1980,11 +1980,10 @@ void Compiler::fgComputeLifeLIR(VARSET_TP& life, BasicBlock* block, VARSET_VALAR
                             GenTree* data =
                                 store->OperIs(GT_STOREIND) ? store->AsStoreInd()->Data() : store->AsBlk()->Data();
                             data->SetUnusedValue();
+
                             if (data->isIndir())
                             {
-                                // This is a block assignment. An indirection of the rhs is not considered
-                                // to happen until the assignment so mark it as non-faulting.
-                                data->gtFlags |= GTF_IND_NONFAULTING;
+                                Lowering::TransformUnusedIndirection(data->AsIndir(), this, block);
                             }
 
                             blockRange.Remove(store);
@@ -2128,8 +2127,8 @@ void Compiler::fgComputeLifeLIR(VARSET_TP& life, BasicBlock* block, VARSET_VALAR
                 if (!removed && node->IsUnusedValue())
                 {
                     // IR doesn't expect dummy uses of `GT_OBJ/BLK/DYN_BLK`.
-                    JITDUMP("Replace an unused OBJ/BLK node [%06d] with a NULLCHECK\n", dspTreeID(node));
-                    gtChangeOperToNullCheck(node, block);
+                    JITDUMP("Transform an unused OBJ/BLK node [%06d]\n", dspTreeID(node));
+                    Lowering::TransformUnusedIndirection(node->AsIndir(), this, block);
                 }
             }
             break;
@@ -2322,17 +2321,6 @@ bool Compiler::fgRemoveDeadStore(GenTree**        pTree,
             }
 #endif // DEBUG
             // Extract the side effects
-            if (rhsNode->TypeGet() == TYP_STRUCT)
-            {
-                // This is a block assignment. An indirection of the rhs is not considered to
-                // happen until the assignment, so we will extract the side effects from only
-                // the address.
-                if (rhsNode->OperIsIndir())
-                {
-                    assert(rhsNode->OperGet() != GT_NULLCHECK);
-                    rhsNode = rhsNode->AsIndir()->Addr();
-                }
-            }
             gtExtractSideEffList(rhsNode, &sideEffList);
         }
 
