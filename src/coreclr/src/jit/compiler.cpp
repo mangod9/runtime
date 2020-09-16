@@ -4949,6 +4949,8 @@ void Compiler::compCompile(void** methodCodePtr, ULONG* methodCodeSize, JitFlags
     {
 #if MEASURE_CLRAPI_CALLS
         EndPhase(PHASE_CLR_API);
+#else
+        EndPhase(PHASE_POST_EMIT);
 #endif
         pCompJitTimer->Terminate(this, CompTimeSummaryInfo::s_compTimeSummary, true);
     }
@@ -5304,9 +5306,9 @@ int Compiler::compCompile(CORINFO_MODULE_HANDLE classPtr,
             compJitFuncInfoFile = _wfopen(compJitFuncInfoFilename, W("a"));
             if (compJitFuncInfoFile == nullptr)
             {
-#if defined(DEBUG) && !defined(TARGET_UNIX) // no 'perror' in the PAL
+#if defined(DEBUG) && !defined(HOST_UNIX) // no 'perror' in the PAL
                 perror("Failed to open JitFuncInfoLogFile");
-#endif // defined(DEBUG) && !defined(TARGET_UNIX)
+#endif // defined(DEBUG) && !defined(HOST_UNIX)
             }
         }
     }

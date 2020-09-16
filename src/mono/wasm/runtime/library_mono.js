@@ -40,6 +40,13 @@
  * @type {number} - address in wasm memory
  */
 
+/**
+ * @typedef Event
+ * @type {object}
+ * @property {string} eventName - name of the event being raised
+ * @property {object} eventArgs - arguments for the event itself
+ */
+
 var MonoSupportLib = {
 	$MONO__postset: 'MONO.export_functions (Module);',
 	$MONO: {
@@ -1326,6 +1333,7 @@ var MonoSupportLib = {
 			var offset = null;
 
 			switch (asset.behavior) {
+				case "resource":
 				case "assembly":
 					ctx.loaded_files.push ({ url: url, file: virtualName});
 				case "heap":
@@ -1385,6 +1393,9 @@ var MonoSupportLib = {
 				else
 					console.error ("Error loading ICU asset", asset.name);
 			}
+			else if (asset.behavior === "resource") {
+				ctx.mono_wasm_add_satellite_assembly (virtualName, asset.culture, offset, bytes.length);
+			}
 		},
 
 		// deprecated
@@ -1428,6 +1439,7 @@ var MonoSupportLib = {
 		//        behavior: (required) determines how the asset will be handled once loaded:
 		//          "heap": store asset into the native heap
 		//          "assembly": load asset as a managed assembly (or debugging information)
+		//          "resource": load asset as a managed resource assembly
 		//          "icu": load asset as an ICU data archive
 		//          "vfs": load asset into the virtual filesystem (for fopen, File.Open, etc)
 		//        load_remote: (optional) if true, an attempt will be made to load the asset
@@ -1546,6 +1558,7 @@ var MonoSupportLib = {
 				tracing: args.diagnostic_tracing || false,
 				pending_count: args.assets.length,
 				mono_wasm_add_assembly: Module.cwrap ('mono_wasm_add_assembly', 'number', ['string', 'number', 'number']),
+				mono_wasm_add_satellite_assembly: Module.cwrap ('mono_wasm_add_satellite_assembly', 'void', ['string', 'string', 'number', 'number']),
 				loaded_assets: Object.create (null),
 				// dlls and pdbs, used by blazor and the debugger
 				loaded_files: [],
@@ -1638,6 +1651,10 @@ var MonoSupportLib = {
 					if (sourcePrefix.trim() === "") {
 						if (asset.behavior === "assembly")
 							attemptUrl = locateFile (args.assembly_root + "/" + asset.name);
+						else if (asset.behavior === "resource") {
+							var path = asset.culture !== '' ? `${asset.culture}/${asset.name}` : asset.name;
+							attemptUrl = locateFile (args.assembly_root + "/" + path);
+						}
 						else
 							attemptUrl = asset.name;
 					} else {
@@ -2040,7 +2057,26 @@ var MonoSupportLib = {
 				data = data.slice(length);
 			}
 			return true;
-		}
+		},
+
+		/**
+		 * Raises an event for the debug proxy
+		 *
+		 * @param {Event} event - event to be raised
+		 * @param {object} args - arguments for raising this event, eg. `{trace: true}`
+		 */
+		mono_wasm_raise_debug_event: function(event, args={}) {
+			if (typeof event !== 'object')
+				throw new Error(`event must be an object, but got ${JSON.stringify(event)}`);
+
+			if (event.eventName === undefined)
+				throw new Error(`event.eventName is a required parameter, in event: ${JSON.stringify(event)}`);
+
+			if (typeof args !== 'object')
+				throw new Error(`args must be an object, but got ${JSON.stringify(args)}`);
+
+			console.debug('mono_wasm_debug_event_raised:aef14bca-5519-4dfe-b35a-f867abc123ae', JSON.stringify(event), JSON.stringify(args));
+		},
 	},
 
 	mono_wasm_add_typed_value: function (type, str_value, value) {
