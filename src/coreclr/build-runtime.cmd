@@ -526,7 +526,7 @@ if %__BuildCrossArchNative% EQU 1 (
         set "__Logging=!__MsbuildLog! !__MsbuildWrn! !__MsbuildErr! !__MsbuildBinLog! !__ConsoleLoggingParameters!"
 
         REM We pass the /m flag directly to MSBuild so that we can get both MSBuild and CL parallelism, which is fastest for our builds.
-        "%CMakePath%" --build %__CrossComp2IntermediatesDir% --target install --config %__BuildType% -- /nologo /m !__Logging!
+        "%CMakePath%" --build "%__CrossComp2IntermediatesDir%" --target install --config %__BuildType% -- /nologo /m !__Logging!
 
         if not !errorlevel! == 0 (
             set __exitCode=!errorlevel!
