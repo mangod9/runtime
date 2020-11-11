@@ -134,12 +134,6 @@ class DbgTransportSession;
 // These hooks must be removed before shipping.
 class ShimProcess;
 
-
-#ifndef TARGET_UNIX
-extern HINSTANCE GetModuleInst();
-#endif
-
-
 template <class T>
 class CordbSafeHashTable;
 
@@ -2533,7 +2527,7 @@ public:
 
     // Unique objects that represent the use of some
                                          // basic ELEMENT_TYPE's as type parameters.  These
-                                         // are shared acrosss the entire process.  We could
+                                         // are shared across the entire process.  We could
                                          // go and try to find the classes corresponding to these
                                          // element types but it seems simpler just to keep
                                          // them as special cases.
@@ -9168,6 +9162,7 @@ class CordbObjectValue : public CordbValue,
                          public ICorDebugValue3,
                          public ICorDebugHeapValue2,
                          public ICorDebugHeapValue3,
+                         public ICorDebugHeapValue4,
                          public ICorDebugExceptionObjectValue,
                          public ICorDebugComObjectValue,
                          public ICorDebugDelegateObjectValue
@@ -9242,6 +9237,11 @@ public:
     //-----------------------------------------------------------
     COM_METHOD GetThreadOwningMonitorLock(ICorDebugThread **ppThread, DWORD *pAcquisitionCount);
     COM_METHOD GetMonitorEventWaitList(ICorDebugThreadEnum **ppThreadEnum);
+
+    //-----------------------------------------------------------
+    // ICorDebugHeapValue4
+    //-----------------------------------------------------------
+    COM_METHOD CreatePinnedHandle(ICorDebugHandleValue ** ppHandle);
 
     //-----------------------------------------------------------
     // ICorDebugObjectValue
@@ -9492,7 +9492,8 @@ class CordbBoxValue : public CordbValue,
                       public ICorDebugValue2,
                       public ICorDebugValue3,
                       public ICorDebugHeapValue2,
-                      public ICorDebugHeapValue3
+                      public ICorDebugHeapValue3,
+                      public ICorDebugHeapValue4
 {
 public:
     CordbBoxValue(CordbAppDomain *  appdomain,
@@ -9583,6 +9584,11 @@ public:
     COM_METHOD GetMonitorEventWaitList(ICorDebugThreadEnum **ppThreadEnum);
 
     //-----------------------------------------------------------
+    // ICorDebugHeapValue4
+    //-----------------------------------------------------------
+    COM_METHOD CreatePinnedHandle(ICorDebugHandleValue ** ppHandle);
+
+    //-----------------------------------------------------------
     // ICorDebugGenericValue
     //-----------------------------------------------------------
 
@@ -9620,7 +9626,8 @@ class CordbArrayValue : public CordbValue,
                         public ICorDebugValue2,
                         public ICorDebugValue3,
                         public ICorDebugHeapValue2,
-                        public ICorDebugHeapValue3
+                        public ICorDebugHeapValue3,
+                        public ICorDebugHeapValue4
 {
 public:
     CordbArrayValue(CordbAppDomain *          appdomain,
@@ -9705,6 +9712,11 @@ public:
     //-----------------------------------------------------------
     COM_METHOD GetThreadOwningMonitorLock(ICorDebugThread **ppThread, DWORD *pAcquisitionCount);
     COM_METHOD GetMonitorEventWaitList(ICorDebugThreadEnum **ppThreadEnum);
+
+    //-----------------------------------------------------------
+    // ICorDebugHeapValue4
+    //-----------------------------------------------------------
+    COM_METHOD CreatePinnedHandle(ICorDebugHandleValue ** ppHandle);
 
     //-----------------------------------------------------------
     // ICorDebugArrayValue

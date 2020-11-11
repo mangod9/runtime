@@ -1592,10 +1592,9 @@ static void LoadAndInitializeJIT(LPCWSTR pwzJitName, OUT HINSTANCE* phJit, OUT I
     HRESULT hr = E_FAIL;
 
     PathString CoreClrFolderHolder;
-    extern HINSTANCE g_hThisInst;
     bool havePath = false;
 
-    if (WszGetModuleFileName(g_hThisInst, CoreClrFolderHolder))
+    if (GetClrModulePathName(CoreClrFolderHolder))
     {
         // Load JIT from next to CoreCLR binary
         havePath = true;
@@ -1849,6 +1848,10 @@ TaggedMemAllocPtr CodeFragmentHeap::RealAllocAlignedMem(size_t  dwRequestedSize
 {
     CrstHolder ch(&m_CritSec);
 
+#if defined(HOST_OSX) && defined(HOST_ARM64)
+    auto jitWriteEnableHolder = PAL_JITWriteEnable(true);
+#endif // defined(HOST_OSX) && defined(HOST_ARM64)
+
     dwRequestedSize = ALIGN_UP(dwRequestedSize, sizeof(TADDR));
 
     if (dwRequestedSize < sizeof(FreeBlock))
@@ -1929,6 +1932,10 @@ void CodeFragmentHeap::RealBackoutMem(void *pMem
     CrstHolder ch(&m_CritSec);
 
     _ASSERTE(dwSize >= sizeof(FreeBlock));
+
+#if defined(HOST_OSX) && defined(HOST_ARM64)
+    auto jitWriteEnableHolder = PAL_JITWriteEnable(true);
+#endif // defined(HOST_OSX) && defined(HOST_ARM64)
 
     ZeroMemory((BYTE *)pMem, dwSize);
 
@@ -4843,6 +4850,10 @@ void ExecutionManager::Unload(LoaderAllocator *pLoaderAllocator)
         NOTHROW;
         GC_NOTRIGGER;
     } CONTRACTL_END;
+
+#if defined(HOST_OSX) && defined(HOST_ARM64)
+    auto jitWriteEnableHolder = PAL_JITWriteEnable(true);
+#endif // defined(HOST_OSX) && defined(HOST_ARM64)
 
     // a size of 0 is a signal to Nirvana to flush the entire cache
     FlushInstructionCache(GetCurrentProcess(),0,0);

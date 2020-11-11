@@ -2779,7 +2779,8 @@
         "4.6.0",
         "4.6.1",
         "4.6.2",
-        "4.7.0"
+        "4.7.0",
+        "4.7.1"
       ],
       "BaselineVersion": "6.0.0",
       "InboxOn": {
@@ -4010,8 +4011,12 @@
       }
     },
     "System.Net.Quic": {
+      "StableVersions": [],
       "InboxOn": {
-        "netcoreapp3.0": "4.2.1.0"
+        "net5.0": "5.0.0.0"
+      },
+      "AssemblyVersionInPackageVersion": {
+        "5.0.0.0": "6.0.0"
       }
     },
     "System.Net.Requests": {
