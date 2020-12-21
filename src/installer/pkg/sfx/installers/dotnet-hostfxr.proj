@@ -29,14 +29,14 @@
   <Target Name="PublishToDisk">
     <Error Condition="'$(OutputPath)' == ''" Text="Publishing to disk requires the OutputPath to be set to the root of the path to write to." />
 
-    <Copy SourceFiles="$(DotNetHostBinDir)\$(LibraryFilePrefix)hostfxr$(LibraryFileExtension)"
+    <Copy SourceFiles="$(DotNetHostBinDir)\$(LibPrefix)hostfxr$(LibSuffix)"
           DestinationFolder="$(OutputPath)/host/fxr/$(Version)" />
   </Target>
 
   <Target Name="AddLinuxPackageInformation" BeforeTargets="GetDebInstallerJsonProperties;GetRpmInstallerJsonProperties">
     <ItemGroup Condition="'$(GenerateDeb)' == 'true'">
       <LinuxPackageDependency Include="libc6;libgcc1;libstdc++6" />
-      <LinuxPackageDependency Include="dotnet-host" Version="$(Version)" />
+      <LinuxPackageDependency Include="dotnet-host" Version="$(InstallerPackageVersion)" />
     </ItemGroup>
     <ItemGroup>
       <RpmJsonProperty Include="directories" Object="[ &quot;/usr/share/dotnet&quot;, &quot;/usr/share/doc/$(VersionedInstallerName)&quot; ]" />
