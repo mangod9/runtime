@@ -778,7 +778,7 @@ public:
     PTR_heap_segment start_segment;
 #ifndef USE_REGIONS
     uint8_t*        allocation_start;
-#endif //USE_REGIONS
+#endif //!USE_REGIONS
     heap_segment*   allocation_segment;
     uint8_t*        allocation_context_start_region;
 #ifdef USE_REGIONS
@@ -797,8 +797,10 @@ public:
     size_t          free_list_space;
     size_t          free_obj_space;
     size_t          allocation_size;
+#ifndef USE_REGIONS
     uint8_t*        plan_allocation_start;
     size_t          plan_allocation_start_size;
+#endif //!USE_REGIONS
 
     // this is the pinned plugs that got allocated into this gen.
     size_t          pinned_allocated;
@@ -1212,6 +1214,8 @@ public:
     PER_HEAP
     void verify_free_lists();
     PER_HEAP
+    void verify_regions();
+    PER_HEAP
     void verify_heap (BOOL begin_gc_p);
     PER_HEAP
     BOOL check_need_card (uint8_t* child_obj, int gen_num_for_cards, 
@@ -1305,6 +1309,16 @@ public:
     void thread_rest_of_generation (generation* gen, heap_segment* region);
     PER_HEAP
     heap_segment* get_new_region (int gen_number);
+    // This allocates one from region allocator and commit the mark array if needed.
+    PER_HEAP_ISOLATED
+    heap_segment* allocate_new_region (gc_heap* hp, int gen_num, bool uoh_p);
+    // When we delete a region we need to update start and tail region
+    // if needed.
+    PER_HEAP
+    void update_start_tail_regions (generation* gen,
+                                    heap_segment* region_to_delete, 
+                                    heap_segment* prev_region, 
+                                    heap_segment* next_region);
 #endif //USE_REGIONS
 
     static
@@ -3363,6 +3377,12 @@ public:
     int num_free_large_regions;
 
     PER_HEAP
+    int num_free_large_regions_added;
+
+    PER_HEAP
+    int num_free_large_regions_removed;
+
+    PER_HEAP
     size_t committed_in_free;
 
     PER_HEAP
@@ -4902,6 +4922,7 @@ heap_segment*& generation_allocation_segment (generation* inst)
 {
   return inst->allocation_segment;
 }
+#ifndef USE_REGIONS
 inline
 uint8_t*& generation_plan_allocation_start (generation* inst)
 {
@@ -4912,6 +4933,7 @@ size_t& generation_plan_allocation_start_size (generation* inst)
 {
   return inst->plan_allocation_start_size;
 }
+#endif //!USE_REGIONS
 inline
 uint8_t*& generation_allocation_context_start_region (generation* inst)
 {
