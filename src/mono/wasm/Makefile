@@ -6,6 +6,7 @@ escape_quote = $(subst ",\",$(1))
 DOTNET=$(TOP)/dotnet.sh
 JSVU=$(HOME)/.jsvu
 CHROMEDRIVER?=$(HOME)/.chromedriver
+GECKODRIVER?=$(HOME)/.geckodriver
 
 #
 # These variables are set by wasm.proj
@@ -22,6 +23,7 @@ SYSTEM_NATIVE_LIBDIR?=$(TOP)/src/libraries/Native/Unix/System.Native
 ENABLE_ES6?=false
 _MSBUILD_WASM_BUILD_ARGS=/p:TargetOS=Browser /p:TargetArchitecture=wasm /p:Configuration=$(CONFIG)
 ENABLE_METADATA_UPDATE?=false
+XHARNESS_BROWSER?=chrome
 
 all: build-native icu-files source-files header-files
 
@@ -31,7 +33,7 @@ all: build-native icu-files source-files header-files
 #  If EMSDK_PATH is not set by the caller, download and setup a local emsdk install.
 #
 
-EMSCRIPTEN_VERSION=2.0.11
+EMSCRIPTEN_VERSION=2.0.12
 EMSDK_LOCAL_PATH=emsdk
 EMCC=source $(EMSDK_PATH)/emsdk_env.sh && emcc
 
@@ -69,8 +71,8 @@ ifeq ($(ENABLE_METADATA_UPDATE),true)
     EMCC_FLAGS+=-DENABLE_METADATA_UPDATE=1
 endif
 
-EMCC_DEBUG_FLAGS =-g -Os -s ASSERTIONS=1 -DENABLE_NETCORE=1 -DDEBUG=1
-EMCC_RELEASE_FLAGS=-Oz --llvm-opts 2 -DENABLE_NETCORE=1
+EMCC_DEBUG_FLAGS =-g -Os -s ASSERTIONS=1 -DDEBUG=1
+EMCC_RELEASE_FLAGS=-Oz --llvm-opts 2
 
 ifeq ($(NOSTRIP),)
 STRIP_CMD=&& $(EMSDK_PATH)/upstream/bin/wasm-opt --strip-dwarf $(NATIVE_BIN_DIR)/dotnet.wasm -o $(NATIVE_BIN_DIR)/dotnet.wasm
@@ -147,6 +149,7 @@ header-files: runtime/pinvoke.h $(BUILDS_OBJ_DIR)/pinvoke-table.h | $(NATIVE_BIN
 
 # Helper targets
 .PHONY: runtime
+.PHONY: build
 
 build:
 	EMSDK_PATH=$(EMSDK_PATH) $(TOP)/build.sh mono+libs.pretest -os Browser -c $(CONFIG) /p:ContinueOnError=false /p:StopOnFirstFailure=true $(MSBUILD_ARGS)
@@ -180,7 +183,7 @@ run-tests-%:
 	PATH="$(JSVU):$(PATH)" $(DOTNET) build $(TOP)/src/libraries/$*/tests/ /t:Test $(_MSBUILD_WASM_BUILD_ARGS) $(MSBUILD_ARGS)
 
 run-browser-tests-%:
-	PATH="$(CHROMEDRIVER):$(PATH)" XHARNESS_COMMAND=test-browser $(DOTNET) build $(TOP)/src/libraries/$*/tests/ /t:Test $(_MSBUILD_WASM_BUILD_ARGS) $(MSBUILD_ARGS)
+	PATH="$(GECKODRIVER):$(CHROMEDRIVER):$(PATH)" XHARNESS_COMMAND="test-browser --browser=$(XHARNESS_BROWSER)" $(DOTNET) build $(TOP)/src/libraries/$*/tests/ /t:Test $(_MSBUILD_WASM_BUILD_ARGS) $(MSBUILD_ARGS)
 
 run-debugger-tests:
 	if [ ! -z "$(TEST_FILTER)" ]; then \
