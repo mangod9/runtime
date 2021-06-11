@@ -5,6 +5,7 @@ using System.Buffers;
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Win32.SafeHandles;
@@ -14,77 +15,141 @@ namespace System.IO.Strategies
     // this type defines a set of stateless FileStream/FileStreamStrategy helper methods
     internal static partial class FileStreamHelpers
     {
-        internal const int ERROR_BROKEN_PIPE = 109;
-        internal const int ERROR_NO_DATA = 232;
-        private const int ERROR_HANDLE_EOF = 38;
-        private const int ERROR_IO_PENDING = 997;
-
-        private static FileStreamStrategy ChooseStrategyCore(SafeFileHandle handle, FileAccess access, int bufferSize, bool isAsync)
+        // Async completion/return codes shared by:
+        // - AsyncWindowsFileStreamStrategy.ValueTaskSource
+        // - Net5CompatFileStreamStrategy.CompletionSource
+        internal static class TaskSourceCodes
         {
-            if (UseLegacyStrategy)
+            internal const long NoResult = 0;
+            internal const long ResultSuccess = (long)1 << 32;
+            internal const long ResultError = (long)2 << 32;
+            internal const long RegisteringCancellation = (long)4 << 32;
+            internal const long CompletedCallback = (long)8 << 32;
+            internal const ulong ResultMask = ((ulong)uint.MaxValue) << 32;
+        }
+
+        private static FileStreamStrategy ChooseStrategyCore(SafeFileHandle handle, FileAccess access, FileShare share, int bufferSize, bool isAsync)
+        {
+            if (UseNet5CompatStrategy)
             {
-                return new LegacyFileStreamStrategy(handle, access, bufferSize, isAsync);
+                // The .NET 5 Compat strategy does not support bufferSize == 0.
+                // To minimize the risk of introducing bugs to it, we just pass 1 to disable the buffering.
+                return new Net5CompatFileStreamStrategy(handle, access, bufferSize == 0 ? 1 : bufferSize, isAsync);
             }
 
             WindowsFileStreamStrategy strategy = isAsync
-                ? new AsyncWindowsFileStreamStrategy(handle, access)
-                : new SyncWindowsFileStreamStrategy(handle, access);
+                ? new AsyncWindowsFileStreamStrategy(handle, access, share)
+                : new SyncWindowsFileStreamStrategy(handle, access, share);
 
             return EnableBufferingIfNeeded(strategy, bufferSize);
         }
 
-        private static FileStreamStrategy ChooseStrategyCore(string path, FileMode mode, FileAccess access, FileShare share, int bufferSize, FileOptions options)
+        private static FileStreamStrategy ChooseStrategyCore(string path, FileMode mode, FileAccess access, FileShare share, int bufferSize, FileOptions options, long preallocationSize)
         {
-            if (UseLegacyStrategy)
+            if (UseNet5CompatStrategy)
             {
-                return new LegacyFileStreamStrategy(path, mode, access, share, bufferSize, options);
+                return new Net5CompatFileStreamStrategy(path, mode, access, share, bufferSize == 0 ? 1 : bufferSize, options, preallocationSize);
             }
 
             WindowsFileStreamStrategy strategy = (options & FileOptions.Asynchronous) != 0
-                ? new AsyncWindowsFileStreamStrategy(path, mode, access, share, options)
-                : new SyncWindowsFileStreamStrategy(path, mode, access, share, options);
+                ? new AsyncWindowsFileStreamStrategy(path, mode, access, share, options, preallocationSize)
+                : new SyncWindowsFileStreamStrategy(path, mode, access, share, options, preallocationSize);
 
             return EnableBufferingIfNeeded(strategy, bufferSize);
         }
 
-        // TODO: we might want to consider strategy.IsPipe here and never enable buffering for async pipes
         internal static FileStreamStrategy EnableBufferingIfNeeded(WindowsFileStreamStrategy strategy, int bufferSize)
-            => bufferSize == 1 ? strategy : new BufferedFileStreamStrategy(strategy, bufferSize);
+            => bufferSize > 1 ? new BufferedFileStreamStrategy(strategy, bufferSize) : strategy;
 
-        internal static SafeFileHandle OpenHandle(string path, FileMode mode, FileAccess access, FileShare share, FileOptions options)
-            => CreateFileOpenHandle(path, mode, access, share, options);
+        internal static SafeFileHandle OpenHandle(string path, FileMode mode, FileAccess access, FileShare share, FileOptions options, long preallocationSize)
+            => CreateFileOpenHandle(path, mode, access, share, options, preallocationSize);
 
-        private static unsafe SafeFileHandle CreateFileOpenHandle(string path, FileMode mode, FileAccess access, FileShare share, FileOptions options)
+        private static unsafe SafeFileHandle CreateFileOpenHandle(string path, FileMode mode, FileAccess access, FileShare share, FileOptions options, long preallocationSize)
         {
-            Interop.Kernel32.SECURITY_ATTRIBUTES secAttrs = GetSecAttrs(share);
-
-            int fAccess =
-                ((access & FileAccess.Read) == FileAccess.Read ? Interop.Kernel32.GenericOperations.GENERIC_READ : 0) |
-                ((access & FileAccess.Write) == FileAccess.Write ? Interop.Kernel32.GenericOperations.GENERIC_WRITE : 0);
-
-            // Our Inheritable bit was stolen from Windows, but should be set in
-            // the security attributes class.  Don't leave this bit set.
-            share &= ~FileShare.Inheritable;
-
-            // Must use a valid Win32 constant here...
-            if (mode == FileMode.Append)
-                mode = FileMode.OpenOrCreate;
-
-            int flagsAndAttributes = (int)options;
-
-            // For mitigating local elevation of privilege attack through named pipes
-            // make sure we always call CreateFile with SECURITY_ANONYMOUS so that the
-            // named pipe server can't impersonate a high privileged client security context
-            // (note that this is the effective default on CreateFile2)
-            flagsAndAttributes |= (Interop.Kernel32.SecurityOptions.SECURITY_SQOS_PRESENT | Interop.Kernel32.SecurityOptions.SECURITY_ANONYMOUS);
-
             using (DisableMediaInsertionPrompt.Create())
             {
                 Debug.Assert(path != null);
-                return ValidateFileHandle(
+
+                if (ShouldPreallocate(preallocationSize, access, mode))
+                {
+                    IntPtr fileHandle = NtCreateFile(path, mode, access, share, options, preallocationSize);
+
+                    return ValidateFileHandle(new SafeFileHandle(fileHandle, ownsHandle: true), path, (options & FileOptions.Asynchronous) != 0);
+                }
+
+                Interop.Kernel32.SECURITY_ATTRIBUTES secAttrs = GetSecAttrs(share);
+
+                int fAccess =
+                    ((access & FileAccess.Read) == FileAccess.Read ? Interop.Kernel32.GenericOperations.GENERIC_READ : 0) |
+                    ((access & FileAccess.Write) == FileAccess.Write ? Interop.Kernel32.GenericOperations.GENERIC_WRITE : 0);
+
+                // Our Inheritable bit was stolen from Windows, but should be set in
+                // the security attributes class.  Don't leave this bit set.
+                share &= ~FileShare.Inheritable;
+
+                // Must use a valid Win32 constant here...
+                if (mode == FileMode.Append)
+                    mode = FileMode.OpenOrCreate;
+
+                int flagsAndAttributes = (int)options;
+
+                // For mitigating local elevation of privilege attack through named pipes
+                // make sure we always call CreateFile with SECURITY_ANONYMOUS so that the
+                // named pipe server can't impersonate a high privileged client security context
+                // (note that this is the effective default on CreateFile2)
+                flagsAndAttributes |= (Interop.Kernel32.SecurityOptions.SECURITY_SQOS_PRESENT | Interop.Kernel32.SecurityOptions.SECURITY_ANONYMOUS);
+
+                SafeFileHandle safeFileHandle = ValidateFileHandle(
                     Interop.Kernel32.CreateFile(path, fAccess, share, &secAttrs, mode, flagsAndAttributes, IntPtr.Zero),
                     path,
                     (options & FileOptions.Asynchronous) != 0);
+
+                return safeFileHandle;
+            }
+        }
+
+        private static IntPtr NtCreateFile(string fullPath, FileMode mode, FileAccess access, FileShare share, FileOptions options, long preallocationSize)
+        {
+            uint ntStatus;
+            IntPtr fileHandle;
+
+            const string mandatoryNtPrefix = @"\??\";
+            if (fullPath.StartsWith(mandatoryNtPrefix, StringComparison.Ordinal))
+            {
+                (ntStatus, fileHandle) = Interop.NtDll.CreateFile(fullPath, mode, access, share, options, preallocationSize);
+            }
+            else
+            {
+                var vsb = new ValueStringBuilder(stackalloc char[1024]);
+                vsb.Append(mandatoryNtPrefix);
+
+                if (fullPath.StartsWith(@"\\?\", StringComparison.Ordinal)) // NtCreateFile does not support "\\?\" prefix, only "\??\"
+                {
+                    vsb.Append(fullPath.AsSpan(4));
+                }
+                else
+                {
+                    vsb.Append(fullPath);
+                }
+
+                (ntStatus, fileHandle) = Interop.NtDll.CreateFile(vsb.AsSpan(), mode, access, share, options, preallocationSize);
+                vsb.Dispose();
+            }
+
+            switch (ntStatus)
+            {
+                case 0:
+                    return fileHandle;
+                case Interop.NtDll.NT_ERROR_STATUS_DISK_FULL:
+                    throw new IOException(SR.Format(SR.IO_DiskFull_Path_AllocationSize, fullPath, preallocationSize));
+                // NtCreateFile has a bug and it reports STATUS_INVALID_PARAMETER for files
+                // that are too big for the current file system. Example: creating a 4GB+1 file on a FAT32 drive.
+                case Interop.NtDll.NT_STATUS_INVALID_PARAMETER:
+                case Interop.NtDll.NT_ERROR_STATUS_FILE_TOO_LARGE:
+                    throw new IOException(SR.Format(SR.IO_FileTooLarge_Path_AllocationSize, fullPath, preallocationSize));
+                default:
+                    int error = (int)Interop.NtDll.RtlNtStatusToDosError((int)ntStatus);
+                    throw Win32Marshal.GetExceptionForWin32Error(error, fullPath);
             }
         }
 
@@ -128,7 +193,7 @@ namespace System.IO.Strategies
             }
 
             // If either of these two flags are set, the file handle is synchronous (not overlapped)
-            return (fileMode & (Interop.NtDll.FILE_SYNCHRONOUS_IO_ALERT | Interop.NtDll.FILE_SYNCHRONOUS_IO_NONALERT)) > 0;
+            return (fileMode & (uint)(Interop.NtDll.CreateOptions.FILE_SYNCHRONOUS_IO_ALERT | Interop.NtDll.CreateOptions.FILE_SYNCHRONOUS_IO_NONALERT)) > 0;
         }
 
         internal static void VerifyHandleIsSync(SafeFileHandle handle)
@@ -168,7 +233,7 @@ namespace System.IO.Strategies
                 // NT5 oddity - when trying to open "C:\" as a Win32FileStream,
                 // we usually get ERROR_PATH_NOT_FOUND from the OS.  We should
                 // probably be consistent w/ every other directory.
-                int errorCode = Marshal.GetLastWin32Error();
+                int errorCode = Marshal.GetLastPInvokeError();
 
                 if (errorCode == Interop.Errors.ERROR_PATH_NOT_FOUND && path!.Length == PathInternal.GetRootLength(path))
                     errorCode = Interop.Errors.ERROR_ACCESS_DENIED;
@@ -219,9 +284,9 @@ namespace System.IO.Strategies
             return ret;
         }
 
-        private static int GetLastWin32ErrorAndDisposeHandleIfInvalid(SafeFileHandle handle)
+        internal static int GetLastWin32ErrorAndDisposeHandleIfInvalid(SafeFileHandle handle)
         {
-            int errorCode = Marshal.GetLastWin32Error();
+            int errorCode = Marshal.GetLastPInvokeError();
 
             // If ERROR_INVALID_HANDLE is returned, it doesn't suffice to set
             // the handle as invalid; the handle must also be closed.
@@ -286,7 +351,7 @@ namespace System.IO.Strategies
                 if (fileType != Interop.Kernel32.FileTypes.FILE_TYPE_DISK)
                 {
                     int errorCode = fileType == Interop.Kernel32.FileTypes.FILE_TYPE_UNKNOWN
-                        ? Marshal.GetLastWin32Error()
+                        ? Marshal.GetLastPInvokeError()
                         : Interop.Errors.ERROR_SUCCESS;
 
                     handle.Dispose();
@@ -325,15 +390,14 @@ namespace System.IO.Strategies
                 &eofInfo,
                 (uint)sizeof(Interop.Kernel32.FILE_END_OF_FILE_INFO)))
             {
-                int errorCode = Marshal.GetLastWin32Error();
+                int errorCode = Marshal.GetLastPInvokeError();
                 if (errorCode == Interop.Errors.ERROR_INVALID_PARAMETER)
                     throw new ArgumentOutOfRangeException(nameof(length), SR.ArgumentOutOfRange_FileLengthTooBig);
                 throw Win32Marshal.GetExceptionForWin32Error(errorCode, path);
             }
         }
 
-        // __ConsoleStream also uses this code.
-        internal static unsafe int ReadFileNative(SafeFileHandle handle, Span<byte> bytes, NativeOverlapped* overlapped, out int errorCode)
+        internal static unsafe int ReadFileNative(SafeFileHandle handle, Span<byte> bytes, bool syncUsingOverlapped, NativeOverlapped* overlapped, out int errorCode)
         {
             Debug.Assert(handle != null, "handle != null");
 
@@ -343,13 +407,24 @@ namespace System.IO.Strategies
             fixed (byte* p = &MemoryMarshal.GetReference(bytes))
             {
                 r = overlapped != null ?
-                    Interop.Kernel32.ReadFile(handle, p, bytes.Length, IntPtr.Zero, overlapped) :
-                    Interop.Kernel32.ReadFile(handle, p, bytes.Length, out numBytesRead, IntPtr.Zero);
+                    (syncUsingOverlapped
+                        ? Interop.Kernel32.ReadFile(handle, p, bytes.Length, out numBytesRead, overlapped)
+                        : Interop.Kernel32.ReadFile(handle, p, bytes.Length, IntPtr.Zero, overlapped))
+                    : Interop.Kernel32.ReadFile(handle, p, bytes.Length, out numBytesRead, IntPtr.Zero);
             }
 
             if (r == 0)
             {
                 errorCode = GetLastWin32ErrorAndDisposeHandleIfInvalid(handle);
+
+                if (syncUsingOverlapped && errorCode == Interop.Errors.ERROR_HANDLE_EOF)
+                {
+                    // https://docs.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-readfile#synchronization-and-file-position :
+                    // "If lpOverlapped is not NULL, then when a synchronous read operation reaches the end of a file,
+                    // ReadFile returns FALSE and GetLastError returns ERROR_HANDLE_EOF"
+                    return numBytesRead;
+                }
+
                 return -1;
             }
             else
@@ -359,7 +434,7 @@ namespace System.IO.Strategies
             }
         }
 
-        internal static unsafe int WriteFileNative(SafeFileHandle handle, ReadOnlySpan<byte> buffer, NativeOverlapped* overlapped, out int errorCode)
+        internal static unsafe int WriteFileNative(SafeFileHandle handle, ReadOnlySpan<byte> buffer, bool syncUsingOverlapped, NativeOverlapped* overlapped, out int errorCode)
         {
             Debug.Assert(handle != null, "handle != null");
 
@@ -369,8 +444,10 @@ namespace System.IO.Strategies
             fixed (byte* p = &MemoryMarshal.GetReference(buffer))
             {
                 r = overlapped != null ?
-                    Interop.Kernel32.WriteFile(handle, p, buffer.Length, IntPtr.Zero, overlapped) :
-                    Interop.Kernel32.WriteFile(handle, p, buffer.Length, out numBytesWritten, IntPtr.Zero);
+                    (syncUsingOverlapped
+                        ? Interop.Kernel32.WriteFile(handle, p, buffer.Length, out numBytesWritten, overlapped)
+                        : Interop.Kernel32.WriteFile(handle, p, buffer.Length, IntPtr.Zero, overlapped))
+                    : Interop.Kernel32.WriteFile(handle, p, buffer.Length, out numBytesWritten, IntPtr.Zero);
             }
 
             if (r == 0)
@@ -460,7 +537,7 @@ namespace System.IO.Strategies
                             }
 
                             // Kick off the read.
-                            synchronousSuccess = ReadFileNative(handle, copyBuffer, readAwaitable._nativeOverlapped, out errorCode) >= 0;
+                            synchronousSuccess = ReadFileNative(handle, copyBuffer, false, readAwaitable._nativeOverlapped, out errorCode) >= 0;
                         }
 
                         // If the operation did not synchronously succeed, it either failed or initiated the asynchronous operation.
@@ -468,11 +545,11 @@ namespace System.IO.Strategies
                         {
                             switch (errorCode)
                             {
-                                case ERROR_IO_PENDING:
+                                case Interop.Errors.ERROR_IO_PENDING:
                                     // Async operation in progress.
                                     break;
-                                case ERROR_BROKEN_PIPE:
-                                case ERROR_HANDLE_EOF:
+                                case Interop.Errors.ERROR_BROKEN_PIPE:
+                                case Interop.Errors.ERROR_HANDLE_EOF:
                                     // We're at or past the end of the file, and the overlapped callback
                                     // won't be raised in these cases. Mark it as completed so that the await
                                     // below will see it as such.
@@ -490,8 +567,8 @@ namespace System.IO.Strategies
                         {
                             case 0: // success
                                 break;
-                            case ERROR_BROKEN_PIPE: // logically success with 0 bytes read (write end of pipe closed)
-                            case ERROR_HANDLE_EOF:  // logically success with 0 bytes read (read at end of file)
+                            case Interop.Errors.ERROR_BROKEN_PIPE: // logically success with 0 bytes read (write end of pipe closed)
+                            case Interop.Errors.ERROR_HANDLE_EOF:  // logically success with 0 bytes read (read at end of file)
                                 Debug.Assert(readAwaitable._numBytes == 0, $"Expected 0 bytes read, got {readAwaitable._numBytes}");
                                 break;
                             case Interop.Errors.ERROR_OPERATION_ABORTED: // canceled
@@ -545,7 +622,7 @@ namespace System.IO.Strategies
             }
         }
 
-        /// <summary>Used by AsyncWindowsFileStreamStrategy and LegacyFileStreamStrategy CopyToAsync to enable awaiting the result of an overlapped I/O operation with minimal overhead.</summary>
+        /// <summary>Used by AsyncWindowsFileStreamStrategy and Net5CompatFileStreamStrategy CopyToAsync to enable awaiting the result of an overlapped I/O operation with minimal overhead.</summary>
         private sealed unsafe class AsyncCopyToAwaitable : ICriticalNotifyCompletion
         {
             /// <summary>Sentinel object used to indicate that the I/O operation has completed before being awaited.</summary>
