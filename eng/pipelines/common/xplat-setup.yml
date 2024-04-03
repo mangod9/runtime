@@ -170,7 +170,7 @@ jobs:
           name: $(DncEngInternalBuildPool)
           demands: ImageOverride -equals windows.vs2022.amd64
 
-        # Public Windows Build Pool 
+        # Public Windows Build Pool
         ${{ if and(or(eq(parameters.osGroup, 'windows'), eq(parameters.jobParameters.hostedOs, 'windows')), eq(variables['System.TeamProject'], 'public')) }}:
           name: $(DncEngPublicBuildPool)
           demands: ImageOverride -equals windows.vs2022.amd64.open
