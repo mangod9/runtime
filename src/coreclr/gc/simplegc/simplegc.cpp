@@ -87,9 +87,9 @@ namespace
     // Keeping both within a single reserve lets us continue publishing one
     // contiguous heap range to the runtime (so write barriers and the card
     // table cover both arenas without any biasing changes).
-    constexpr size_t kPermSize       = 192 * 1024 * 1024;
-    constexpr size_t kRequestSize    = 64  * 1024 * 1024;
-    constexpr size_t kHeapSize       = kPermSize + kRequestSize; // 256 MB
+    constexpr size_t kPermSize       = 1024 * 1024 * 1024;  // 1 GB
+    constexpr size_t kRequestSize    = 256  * 1024 * 1024;  // 256 MB
+    constexpr size_t kHeapSize       = kPermSize + kRequestSize; // 1.25 GB
     constexpr size_t kCommitGrain    = 16 * 1024 * 1024;
     constexpr size_t kAllocCtxQuant  = 8 * 1024;
 

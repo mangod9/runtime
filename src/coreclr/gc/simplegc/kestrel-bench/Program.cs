@@ -115,10 +115,89 @@ internal sealed class ItemsResponse
     public int Hash { get; set; }
 }
 
+// Catalog domain - representative of an e-commerce product catalog API.
+// Catalog data is built ONCE at startup and lives in perm. Each request
+// allocates: query strings (parsed from URL), an intermediate filter list,
+// a sorted result array, projected ProductSummary[], JSON serialization
+// buffers. Estimate ~30-60 KB per request depending on match count.
+
+internal sealed class Product
+{
+    public int Id { get; set; }
+    public string Sku { get; set; } = "";
+    public string Name { get; set; } = "";
+    public string Description { get; set; } = "";
+    public double Price { get; set; }
+    public int Stock { get; set; }
+    public string[] Tags { get; set; } = Array.Empty<string>();
+}
+
+internal sealed class ProductSummary
+{
+    public int Id { get; set; }
+    public string Sku { get; set; } = "";
+    public string Name { get; set; } = "";
+    public double Price { get; set; }
+    public int MatchScore { get; set; }
+}
+
+internal sealed class SearchResponse
+{
+    public string Query { get; set; } = "";
+    public double MinPrice { get; set; }
+    public int TotalMatches { get; set; }
+    public ProductSummary[] Results { get; set; } = Array.Empty<ProductSummary>();
+}
+
 [JsonSerializable(typeof(ItemsResponse))]
 [JsonSerializable(typeof(Item[]))]
 [JsonSerializable(typeof(Item))]
+[JsonSerializable(typeof(SearchResponse))]
+[JsonSerializable(typeof(ProductSummary[]))]
+[JsonSerializable(typeof(ProductSummary))]
 internal partial class AppJsonContext : JsonSerializerContext { }
+
+internal static class Catalog
+{
+    // 10k products generated deterministically. Long-lived: built once at
+    // Build() time, stays referenced by a static field for the life of the
+    // process. In simplegc this lives in perm.
+    public static Product[] Products { get; private set; } = Array.Empty<Product>();
+
+    private static readonly string[] s_adjectives =
+        { "premium", "deluxe", "classic", "essential", "ultra", "compact", "rugged", "sleek", "smart", "vintage" };
+    private static readonly string[] s_nouns =
+        { "widget", "gadget", "sprocket", "gizmo", "device", "tool", "kit", "stand", "mount", "case",
+          "cable", "adapter", "charger", "speaker", "lamp", "monitor", "keyboard", "mouse", "headset", "camera" };
+    private static readonly string[] s_tagPool =
+        { "new", "sale", "popular", "outdoor", "indoor", "wireless", "rechargeable", "ergonomic", "portable", "ecofriendly" };
+
+    public static void Initialize(int count)
+    {
+        var rng = new Random(42); // deterministic
+        var products = new Product[count];
+        for (int i = 0; i < count; i++)
+        {
+            string adj = s_adjectives[rng.Next(s_adjectives.Length)];
+            string noun = s_nouns[rng.Next(s_nouns.Length)];
+            int tagCount = 1 + rng.Next(3);
+            var tags = new string[tagCount];
+            for (int t = 0; t < tagCount; t++) tags[t] = s_tagPool[rng.Next(s_tagPool.Length)];
+            products[i] = new Product
+            {
+                Id = i,
+                Sku = string.Create(System.Globalization.CultureInfo.InvariantCulture, $"SKU-{i:D6}"),
+                Name = string.Create(System.Globalization.CultureInfo.InvariantCulture, $"{adj} {noun} {i}"),
+                Description = string.Create(System.Globalization.CultureInfo.InvariantCulture,
+                    $"Our {adj} {noun} model #{i} is engineered for performance and reliability. Includes a 2-year warranty."),
+                Price = Math.Round(5.0 + rng.NextDouble() * 495.0, 2),
+                Stock = rng.Next(1000),
+                Tags = tags
+            };
+        }
+        Products = products;
+    }
+}
 
 internal static class Handler
 {
@@ -147,6 +226,115 @@ internal static class Handler
 
         return new ItemsResponse { RequestId = requestId, Items = items, Hash = sum };
     }
+
+    // Catalog search handler. Filter products by name/description containing q
+    // (case-insensitive ASCII), and price >= minPrice. Sort matching products
+    // by (score desc, price desc). Project the top 50 to ProductSummary. This
+    // shape is typical of an e-commerce listing API.
+    public static SearchResponse Search(string? q, double minPrice)
+    {
+        q ??= "";
+        var products = Catalog.Products;
+
+        // Lowercase the query once. Ascii-only fast path.
+        string ql = q.Length == 0 ? "" : q.ToLowerInvariant();
+
+        // First pass: count matches and remember which indices matched. A
+        // single byte[catalog] keeps the marker compact (10 KB) regardless of
+        // catalog size, vs a Match[catalog] at 160 KB. We then size the
+        // Match[] to the exact match count for the sort.
+        var marks = new byte[products.Length];
+        int matchCount = 0;
+        for (int i = 0; i < products.Length; i++)
+        {
+            var p = products[i];
+            if (p.Price < minPrice) continue;
+            int score;
+            if (ql.Length == 0)
+            {
+                score = 1;
+            }
+            else
+            {
+                score = 0;
+                if (ContainsIgnoreCase(p.Name, ql)) score += 3;
+                if (ContainsIgnoreCase(p.Description, ql)) score += 1;
+                if (score == 0) continue;
+            }
+            marks[i] = (byte)score;
+            matchCount++;
+        }
+
+        // Second pass: pack matches into a sorted-size Match[].
+        var matches = new Match[matchCount];
+        int mi = 0;
+        for (int i = 0; i < products.Length && mi < matchCount; i++)
+        {
+            byte s = marks[i];
+            if (s == 0) continue;
+            matches[mi++] = new Match { Id = i, Score = s, Price = products[i].Price };
+        }
+
+        // Sort by (score desc, price desc).
+        matches.AsSpan().Sort(static (a, b) =>
+        {
+            int s = b.Score - a.Score;
+            return s != 0 ? s : b.Price.CompareTo(a.Price);
+        });
+
+        int take = Math.Min(50, matchCount);
+        var results = new ProductSummary[take];
+        for (int i = 0; i < take; i++)
+        {
+            ref var m = ref matches[i];
+            var p = products[m.Id];
+            results[i] = new ProductSummary
+            {
+                Id = p.Id,
+                Sku = p.Sku,
+                Name = p.Name,
+                Price = p.Price,
+                MatchScore = m.Score
+            };
+        }
+
+        return new SearchResponse
+        {
+            Query = q,
+            MinPrice = minPrice,
+            TotalMatches = matchCount,
+            Results = results
+        };
+    }
+
+    private struct Match
+    {
+        public int Id;
+        public int Score;
+        public double Price;
+    }
+
+    private static bool ContainsIgnoreCase(string haystack, string needleLower)
+    {
+        // Case-insensitive ASCII contains - avoid culture-aware overloads
+        // which lazily init NumberFormatInfo / CompareInfo per thread (the
+        // very thing we hit at concurrency > 1).
+        if (needleLower.Length == 0) return true;
+        if (haystack.Length < needleLower.Length) return false;
+        int last = haystack.Length - needleLower.Length;
+        for (int i = 0; i <= last; i++)
+        {
+            int j = 0;
+            for (; j < needleLower.Length; j++)
+            {
+                char a = haystack[i + j];
+                if (a >= 'A' && a <= 'Z') a = (char)(a + 32);
+                if (a != needleLower[j]) break;
+            }
+            if (j == needleLower.Length) return true;
+        }
+        return false;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -159,6 +347,11 @@ internal static class Server
 
     public static IHost Build()
     {
+        // Initialize the catalog before Kestrel starts so the ~10k products
+        // are referenced from the static field BEFORE the first request and
+        // therefore land in perm under simplegc.
+        Catalog.Initialize(10_000);
+
         var builder = Host.CreateDefaultBuilder()
             .ConfigureLogging(l => l.ClearProviders())   // no log allocations on the hot path
             .ConfigureWebHostDefaults(web =>
@@ -185,9 +378,29 @@ internal static class Server
 
                     app.Run(async ctx =>
                     {
-                        // Parse a request id out of the path: /items/N -> N
+                        var path = ctx.Request.Path.Value ?? "";
+                        ctx.Response.ContentType = "application/json";
+
+                        if (path.StartsWith("/search", StringComparison.Ordinal))
+                        {
+                            // Parse ?q= and ?minPrice= directly from the
+                            // QueryString to avoid IQueryCollection allocations
+                            // that lazy-init parsers per thread.
+                            string? q = ctx.Request.Query["q"].ToString();
+                            double minPrice = 0;
+                            string mp = ctx.Request.Query["minPrice"].ToString();
+                            if (!string.IsNullOrEmpty(mp))
+                                double.TryParse(mp, System.Globalization.NumberStyles.Float,
+                                    System.Globalization.CultureInfo.InvariantCulture, out minPrice);
+
+                            SearchResponse response = Handler.Search(q, minPrice);
+                            await ctx.Response.WriteAsJsonAsync(response,
+                                AppJsonContext.Default.SearchResponse);
+                            return;
+                        }
+
+                        // Default /items/N path - simple smoke test handler
                         int requestId = 0;
-                        var path = ctx.Request.Path.Value;
                         if (!string.IsNullOrEmpty(path))
                         {
                             int slash = path.LastIndexOf('/');
@@ -195,10 +408,8 @@ internal static class Server
                                 int.TryParse(path.AsSpan(slash + 1), out requestId);
                         }
 
-                        ItemsResponse response = Handler.Build(requestId);
-
-                        ctx.Response.ContentType = "application/json";
-                        await ctx.Response.WriteAsJsonAsync(response,
+                        ItemsResponse itemsResp = Handler.Build(requestId);
+                        await ctx.Response.WriteAsJsonAsync(itemsResp,
                             AppJsonContext.Default.ItemsResponse);
                     });
                 });
@@ -213,7 +424,24 @@ internal static class Server
 
 internal static class Driver
 {
-    public static async Task<int> RunAsync(int totalRequests, int concurrency)
+    // Pseudo-random query terms for /search. Picked so a few terms match
+    // many products (long tail) and others match few. Terms come from the
+    // adjective/noun pools used to generate the catalog.
+    private static readonly string[] s_queryTerms =
+    {
+        "widget",        // common noun -> ~10% of catalog
+        "premium",       // common adj  -> ~10% of catalog
+        "smart camera",  // 2-word, narrower
+        "ultra mount",   // 2-word, narrower
+        "vintage",       // adj only
+        "headset",       // narrower
+        "sprocket",      // narrower
+        "wireless",      // doesn't match by name (only tags) -> 0 matches
+        "",              // empty query -> all products price-filtered
+        "rugged kit"     // narrow
+    };
+
+    public static async Task<int> RunAsync(string endpoint, int totalRequests, int concurrency)
     {
         // One HttpClient per worker; pre-create to avoid per-iter handler init
         var clients = new HttpClient[concurrency];
@@ -225,25 +453,30 @@ internal static class Driver
         long[] elapsedTicks = new long[totalRequests];
         long failures = 0;
 
-        // Warm-up: a small batch of requests to prime ASP.NET pipeline (route
-        // table, JSON formatter, ResponseHeaders pool, JsonSerializerContext
-        // CWT entries, etc.). Discard timings. The arena bracket is DISARMED
-        // during warmup so all lazy-init storage lands in perm.
-        //
-        // NOTE: warmup is sequential on a single client. Server-side, this
-        // means Kestrel will mostly use a single threadpool thread to serve
-        // these warmups. After arming, if Kestrel dispatches a request to a
-        // FRESH threadpool thread (one that wasn't used during warmup), that
-        // thread's first-time per-thread init (NumberFormatInfo.CurrentInfo
-        // and friends - they are [ThreadStatic]) lands in the request arena
-        // and is rewound at request_end -> AV on the next access. The
-        // bench therefore only runs cleanly at concurrency = 1. Solving this
-        // for c > 1 needs either suspend-EE-style coordinated rewind or
-        // per-thread arena slices.
-        Console.WriteLine($"driver: warmup {2000} reqs (arena disarmed)...");
-        for (int i = 0; i < 2000; i++)
+        // Build a request URL for iteration idx. /items/{idx} or /search?q=...&minPrice=...
+        string Url(int idx)
         {
-            using var resp = await clients[0].GetAsync("/items/" + i);
+            if (endpoint == "items") return "/items/" + idx;
+            // /search: vary q and minPrice deterministically per idx so the
+            // same idx always produces the same URL (for reproducibility).
+            string q = s_queryTerms[idx % s_queryTerms.Length];
+            int minPriceIdx = (idx / s_queryTerms.Length) % 10;
+            int minPrice = minPriceIdx * 50;        // 0, 50, 100, ..., 450
+            if (string.IsNullOrEmpty(q))
+                return "/search?minPrice=" + minPrice;
+            return "/search?q=" + Uri.EscapeDataString(q) + "&minPrice=" + minPrice;
+        }
+
+        // Warm-up: prime ASP.NET pipeline (route table, JSON formatter,
+        // ResponseHeaders pool, JsonSerializerContext CWT entries, etc.).
+        // Discard timings. The arena bracket is DISARMED during warmup so
+        // all lazy-init storage commits to perm. Keep warmup small because
+        // every byte allocated here grows perm permanently.
+        const int warmup = 500;
+        Console.WriteLine($"driver: warmup {warmup} reqs (arena disarmed)...");
+        for (int i = 0; i < warmup; i++)
+        {
+            using var resp = await clients[0].GetAsync(Url(i));
             if (!resp.IsSuccessStatusCode) failures++;
         }
         Console.WriteLine($"driver: warmup done (failures={failures}).");
@@ -278,7 +511,7 @@ internal static class Driver
                     sw.Restart();
                     try
                     {
-                        using var resp = await client.GetAsync("/items/" + idx);
+                        using var resp = await client.GetAsync(Url(idx));
                         sw.Stop();
                         elapsedTicks[idx] = sw.ElapsedTicks;
                         if (!resp.IsSuccessStatusCode) Interlocked.Increment(ref failures);
@@ -354,36 +587,29 @@ internal static class Program
     {
         int totalRequests = 50_000;
         int concurrency = 8;
+        string endpoint = "search"; // "items" or "search"
         for (int i = 0; i < args.Length - 1; i++)
         {
             if (args[i] == "--n") int.TryParse(args[i + 1], out totalRequests);
             if (args[i] == "--c") int.TryParse(args[i + 1], out concurrency);
+            if (args[i] == "--ep") endpoint = args[i + 1];
         }
-
-        // Pin the threadpool size so no new threadpool worker can arrive AFTER
-        // we arm the arena. Each new thread does first-time per-thread inits
-        // (NumberFormatInfo, CurrentCulture, etc.) which would land in the
-        // request arena and AV the next request that touches them. Reserve
-        // enough for the server (concurrency req-handlers) + driver workers +
-        // headroom for Kestrel internal I/O work.
-        int pool = Math.Max(32, concurrency * 4);
-        ThreadPool.SetMinThreads(pool, pool);
-        ThreadPool.SetMaxThreads(pool, pool);
 
         Console.WriteLine("=== SimpleGC kestrel-bench ===");
         Console.WriteLine($"  simplegc loaded : {SimpleGC.IsLoaded}");
         Console.WriteLine($"  arena configured: {SimpleGC.ArenaConfigured}");
+        Console.WriteLine($"  endpoint        : /{endpoint}");
         Console.WriteLine($"  total requests  : {totalRequests:N0}");
         Console.WriteLine($"  concurrency     : {concurrency}");
         Console.WriteLine($"  url             : {Server.Url}");
 
         using var host = Server.Build();
         await host.StartAsync();
-        Console.WriteLine("server started.");
+        Console.WriteLine($"server started. catalog has {Catalog.Products.Length:N0} products.");
 
         try
         {
-            return await Driver.RunAsync(totalRequests, concurrency);
+            return await Driver.RunAsync(endpoint, totalRequests, concurrency);
         }
         finally
         {
