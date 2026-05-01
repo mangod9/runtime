@@ -69,21 +69,119 @@ static void simplegc_log(int level, const char* fmt, ...)
 
 namespace
 {
-    // Heap parameters
-    constexpr size_t kHeapSize       = 256 * 1024 * 1024; // 256 MB reserved
-    constexpr size_t kCommitGrain    = 16 * 1024 * 1024;  // commit in 16 MB chunks
-    constexpr size_t kAllocCtxQuant  = 8 * 1024;          // 8 KB per per-thread alloc context refill
+    // Heap parameters. We carve a single 256 MB VirtualReserve into two
+    // arenas:
+    //   * perm    (192 MB at low end) - long-lived state, never reset
+    //   * request (64 MB at high end) - reset by simplegc_request_end()
+    //
+    // Keeping both within a single reserve lets us continue publishing one
+    // contiguous heap range to the runtime (so write barriers and the card
+    // table cover both arenas without any biasing changes).
+    constexpr size_t kPermSize       = 192 * 1024 * 1024;
+    constexpr size_t kRequestSize    = 64  * 1024 * 1024;
+    constexpr size_t kHeapSize       = kPermSize + kRequestSize; // 256 MB
+    constexpr size_t kCommitGrain    = 16 * 1024 * 1024;
+    constexpr size_t kAllocCtxQuant  = 8 * 1024;
 
-    // Bump-pointer arena state
-    std::mutex         g_heapLock;
-    uint8_t*           g_heapStart    = nullptr;
-    uint8_t*           g_heapCommitted= nullptr; // first uncommitted byte
-    uint8_t*           g_heapEnd      = nullptr; // first reserved-but-uncommitted byte (heapStart + kHeapSize)
-    uint8_t*           g_bumpPtr      = nullptr; // first free byte
+    // Each arena owns its own bump pointer, committed-watermark, and lock.
+    struct Arena
+    {
+        std::mutex lock;
+        uint8_t*   start      = nullptr;
+        uint8_t*   end        = nullptr;
+        uint8_t*   committed  = nullptr; // first uncommitted byte
+        uint8_t*   bump       = nullptr; // first free byte
+        uint8_t*   checkpoint = nullptr; // saved bump for current request-scope reset
+    };
+
+    Arena g_perm;
+    Arena g_request;
+
+    // Overall VirtualReserve range (perm.start .. request.end). Used by
+    // IsHeapPointer / RegisterFrozenSegment etc. that want to know "is this
+    // anywhere in our managed heap?"
+    uint8_t*  g_heapStart = nullptr;
+    uint8_t*  g_heapEnd   = nullptr;
+
+    // Per-thread "active arena". null = use g_perm. Set by simplegc_request_begin.
+    thread_local Arena* t_activeArena = nullptr;
+
+    // Per-thread last-observed alloc context. Cached so simplegc_request_end
+    // can flush it (force the next allocation to refill from perm) without
+    // walking all alloc contexts.
+    thread_local gc_alloc_context* t_lastAllocCtx = nullptr;
+
+    // Flushes the alloc-context cache so the runtime's fast path falls back
+    // into our IGCHeap::Alloc on the next allocation.
+    //
+    // CRITICAL: the runtime's fast path (e.g. RhpNewArrayFast) does NOT use
+    // gc_alloc_context::alloc_limit. It uses ee_alloc_context::combined_limit,
+    // which is the field located *immediately before* gc_alloc_context in the
+    // owning ee_alloc_context (offset -sizeof(uint8_t*) from acontext). The
+    // fast path computes "available = combined_limit - alloc_ptr" and only
+    // bails to slow path if (size > available). If we zero alloc_ptr but
+    // leave combined_limit at a non-zero value, available is computed as a
+    // huge unsigned number and the fast path "succeeds", writing the new
+    // object's MethodTable to address 0 -> AV.
+    //
+    // Layout (per src/coreclr/vm/gcheaputilities.h ee_alloc_context):
+    //   offset  0: uint8_t* combined_limit
+    //   offset +8: gc_alloc_context  (i.e. what we get as 'acontext')
+    //              +0: alloc_ptr
+    //              +8: alloc_limit
+    //              ...
+    static inline void simplegc_flush_alloc_context(gc_alloc_context* acontext)
+    {
+        if (acontext == nullptr) return;
+        // Zero combined_limit (the field 8 bytes before acontext).
+        uint8_t** combinedLimit = reinterpret_cast<uint8_t**>(
+            reinterpret_cast<uint8_t*>(acontext) - sizeof(uint8_t*));
+        *combinedLimit = nullptr;
+        acontext->alloc_ptr   = nullptr;
+        acontext->alloc_limit = nullptr;
+    }
 
     std::atomic<uint64_t> g_totalAllocated{0};
+    std::atomic<uint64_t> g_requestedBytes{0};
     std::atomic<uint64_t> g_objectCount{0};
     std::atomic<uint64_t> g_gcCount{0};
+
+    // ---- Phase 3: managed strategy bridge -----------------------------------
+    //
+    // The app registers a function pointer to a [UnmanagedCallersOnly] managed
+    // method via simplegc_register_strategy(). simplegc::Alloc consults this
+    // method when allocation crosses kConsultThreshold bytes since the last
+    // consult. The method must NEVER allocate (it runs from inside Alloc).
+
+    constexpr uint32_t kStrategyAbiVersion = 1;
+    constexpr uint64_t kConsultThreshold   = 256 * 1024; // 256 KB
+}
+
+// File-scope (external linkage) so the extern "C" exports below can use these
+// types in their parameter lists without warnings. The struct + typedef are not
+// part of any public header — strategy authors mirror them in managed code.
+
+// Stats blob passed by-pointer to the managed callback. New fields must be
+// appended; ABI version + size are checked at registration time so old
+// strategies on a newer GC keep working.
+struct SimpleGCStats
+{
+    uint64_t totalAllocatedBytes;     // raw alloc-context refill bytes
+    uint64_t requestedBytes;          // bytes the runtime actually requested (object sizes)
+    uint64_t objectCount;
+    uint64_t gcCount;
+    uint64_t bytesSinceLastConsult;
+};
+static_assert(sizeof(SimpleGCStats) == 40, "SimpleGCStats ABI size mismatch");
+
+using ShouldCollectFn = int (LOCALGC_CALLCONV *)(const SimpleGCStats* stats);
+
+namespace
+{
+    std::atomic<ShouldCollectFn> g_shouldCollect{nullptr};
+    std::atomic<uint64_t>        g_consultCount{0};
+    std::atomic<uint64_t>        g_strategyApprovedGCs{0};
+    std::atomic<uint64_t>        g_bytesAtLastConsult{0};
 
     // A "card table" placeholder. Real GCs use this for write barriers; we don't
     // collect, but the runtime expects a non-null card table when we publish our
@@ -147,21 +245,39 @@ static bool simplegc_init_heap()
         return false;
     }
 
-    g_heapCommitted = g_heapStart;
-    g_heapEnd       = g_heapStart + kHeapSize;
+    g_heapEnd = g_heapStart + kHeapSize;
+
+    // Carve into perm + request arenas.
+    g_perm.start      = g_heapStart;
+    g_perm.end        = g_heapStart + kPermSize;
+    g_perm.committed  = g_perm.start;
+    g_perm.bump       = g_perm.start;
+
+    g_request.start     = g_perm.end;
+    g_request.end       = g_heapEnd;
+    g_request.committed = g_request.start;
+    g_request.bump      = g_request.start;
+
     // The runtime reads SIZEOF_OBJHEADER (8 bytes on x64) of zero memory immediately
     // *before* every Object pointer to inspect the SyncBlock index. Reserve a small
-    // padding area at the start of the heap so the first object pointer we hand out
-    // has a valid (committed, zero-initialized) sync-block prefix.
+    // padding area at the start of EACH arena so the first object pointer we hand
+    // out has a valid (committed, zero-initialized) sync-block prefix.
     constexpr size_t kStartPadding = 64;
-    g_bumpPtr       = g_heapStart + kStartPadding;
-    // Force a commit on the start padding so the first read of obj-8 is mapped.
-    if (!GCToOSInterface::VirtualCommit(g_heapStart, kStartPadding))
+    g_perm.bump = g_perm.start + kStartPadding;
+    if (!GCToOSInterface::VirtualCommit(g_perm.start, kStartPadding))
     {
-        LOG1("VirtualCommit(start padding) failed");
+        LOG1("VirtualCommit(perm start padding) failed");
         return false;
     }
-    g_heapCommitted = g_heapStart + ((kStartPadding + 4095) & ~static_cast<size_t>(4095));
+    g_perm.committed = g_perm.start + ((kStartPadding + 4095) & ~static_cast<size_t>(4095));
+
+    g_request.bump = g_request.start + kStartPadding;
+    if (!GCToOSInterface::VirtualCommit(g_request.start, kStartPadding))
+    {
+        LOG1("VirtualCommit(request start padding) failed");
+        return false;
+    }
+    g_request.committed = g_request.start + ((kStartPadding + 4095) & ~static_cast<size_t>(4095));
 
     g_gc_lowest_address  = g_heapStart;
     g_gc_highest_address = g_heapEnd;
@@ -196,43 +312,44 @@ static bool simplegc_init_heap()
     }
 #endif
 
-    LOG1("heap reserved at %p .. %p (size=%zu MB)", g_heapStart, g_heapEnd, kHeapSize >> 20);
+    LOG1("heap reserved at %p .. %p (perm=%zu MB, request=%zu MB)",
+         g_heapStart, g_heapEnd, kPermSize >> 20, kRequestSize >> 20);
     return true;
 }
 
-static bool simplegc_commit(size_t bytesNeeded)
+// Commit more pages in the given arena to satisfy bytesNeeded. Caller holds arena.lock.
+static bool simplegc_commit(Arena& arena, size_t bytesNeeded)
 {
-    // Caller holds g_heapLock.
-    if (g_bumpPtr + bytesNeeded > g_heapCommitted)
+    if (arena.bump + bytesNeeded > arena.committed)
     {
-        size_t want = (size_t)(g_bumpPtr + bytesNeeded - g_heapCommitted);
+        size_t want = (size_t)(arena.bump + bytesNeeded - arena.committed);
         size_t grain = (want + kCommitGrain - 1) & ~(kCommitGrain - 1);
-        if (g_heapCommitted + grain > g_heapEnd)
+        if (arena.committed + grain > arena.end)
         {
-            LOG1("OOM: cannot commit additional %zu bytes (used=%zu)",
-                 grain, (size_t)(g_bumpPtr - g_heapStart));
+            LOG1("OOM in arena [%p..%p): need %zu (used=%zu)",
+                 arena.start, arena.end, grain, (size_t)(arena.bump - arena.start));
             return false;
         }
-        if (!GCToOSInterface::VirtualCommit(g_heapCommitted, grain))
+        if (!GCToOSInterface::VirtualCommit(arena.committed, grain))
         {
             LOG1("VirtualCommit(%zu) failed", grain);
             return false;
         }
-        g_heapCommitted += grain;
+        arena.committed += grain;
     }
     return true;
 }
 
-// Bump-pointer raw allocate. Caller is responsible for setting MethodTable.
-static uint8_t* simplegc_raw_alloc(size_t size)
+// Bump-pointer raw allocate from a specific arena.
+static uint8_t* simplegc_raw_alloc(Arena& arena, size_t size)
 {
-    std::lock_guard<std::mutex> guard(g_heapLock);
+    std::lock_guard<std::mutex> guard(arena.lock);
     // Align to 8 (small object alignment).
     size = (size + 7) & ~static_cast<size_t>(7);
-    if (!simplegc_commit(size))
+    if (!simplegc_commit(arena, size))
         return nullptr;
-    uint8_t* p = g_bumpPtr;
-    g_bumpPtr += size;
+    uint8_t* p = arena.bump;
+    arena.bump += size;
     g_totalAllocated.fetch_add(size, std::memory_order_relaxed);
     g_objectCount.fetch_add(1, std::memory_order_relaxed);
     return p;
@@ -418,7 +535,7 @@ public:
         if (lastRecordedMemLoadBytes)      *lastRecordedMemLoadBytes = 0;
         if (lastRecordedHeapSizeBytes)     *lastRecordedHeapSizeBytes = g_totalAllocated.load();
         if (lastRecordedFragmentationBytes)*lastRecordedFragmentationBytes = 0;
-        if (totalCommittedBytes)           *totalCommittedBytes = (size_t)(g_heapCommitted - g_heapStart);
+        if (totalCommittedBytes)           *totalCommittedBytes = (size_t)((g_perm.committed - g_perm.start) + (g_request.committed - g_request.start));
         if (promotedBytes)                 *promotedBytes = 0;
         if (pinnedObjectCount)             *pinnedObjectCount = 0;
         if (finalizationPendingCount)      *finalizationPendingCount = 0;
@@ -548,21 +665,113 @@ public:
     // ---- Allocation ----------------------------------------------------
     Object* Alloc(gc_alloc_context* acontext, size_t size, uint32_t flags) override
     {
+        // ---- Phase 3 strategy hook: consult BEFORE we reserve any space ----
+        //
+        // We must do this *before* simplegc_raw_alloc because once we hand
+        // back a chunk pointer the runtime treats it as a partially-constructed
+        // object. Calling back into managed from there would be unsafe if the
+        // managed code ever triggers a real GC.
+        //
+        // Re-entrancy: the callback may itself trigger Alloc (e.g. JIT prestub,
+        // type init). We block recursive consults via a thread-local flag.
+        static thread_local bool s_inConsult = false;
+        if (!s_inConsult)
+        {
+            auto fn = g_shouldCollect.load(std::memory_order_acquire);
+            if (fn != nullptr)
+            {
+                uint64_t total = g_totalAllocated.load(std::memory_order_relaxed);
+                uint64_t last  = g_bytesAtLastConsult.load(std::memory_order_relaxed);
+                if (total >= last + kConsultThreshold)
+                {
+                    if (g_bytesAtLastConsult.compare_exchange_strong(last, total))
+                    {
+                        s_inConsult = true;
+                        SimpleGCStats stats =
+                        {
+                            total,
+                            g_requestedBytes.load(std::memory_order_relaxed),
+                            g_objectCount.load(std::memory_order_relaxed),
+                            g_gcCount.load(std::memory_order_relaxed),
+                            total - last
+                        };
+
+                        // Transition to preemptive mode while running managed
+                        // code (per IGCToCLR contract for calling back into
+                        // managed from within GC code).
+                        bool toggled = GCToEEInterface::EnablePreemptiveGC();
+                        int result = fn(&stats);
+                        if (toggled) GCToEEInterface::DisablePreemptiveGC();
+
+                        g_consultCount.fetch_add(1, std::memory_order_relaxed);
+                        if (result != 0)
+                        {
+                            g_strategyApprovedGCs.fetch_add(1, std::memory_order_relaxed);
+                            // We don't actually collect yet; bumping g_gcCount
+                            // here would lie to CollectionCount. The strategy
+                            // approval is reported separately via telemetry.
+                        }
+                        s_inConsult = false;
+                    }
+                }
+            }
+        }
+
         // Refill the alloc context with a fresh chunk and place this object inside.
         // The runtime fast-path will then bump-allocate from the context until it's
         // exhausted again.
+        //
+        // Phase 4: route refills through the thread's active arena (perm by
+        // default; request when inside simplegc_request_begin/end).
+        //
+        // Important: certain allocation classes are conceptually long-lived or
+        // require special handling that the request-arena rewind can't honor:
+        //   * LOH/POH: large/pinned objects shouldn't bleed into a 64 MB arena
+        //     and POH objects mustn't move - they shouldn't be rewound either.
+        //   * FINALIZE: finalizable objects need F-reachable tracking; rewinding
+        //     them would skip the finalizer.
+        // Send all of these to perm even when a request bracket is active.
+        const uint32_t kAlwaysPermFlags =
+            GC_ALLOC_FINALIZE | GC_ALLOC_LARGE_OBJECT_HEAP | GC_ALLOC_PINNED_OBJECT_HEAP;
+        bool forcePerm = (flags & kAlwaysPermFlags) != 0;
+        Arena& targetArena = (t_activeArena != nullptr && !forcePerm) ? *t_activeArena : g_perm;
+
         size_t chunkSize = (size > kAllocCtxQuant) ? size : kAllocCtxQuant;
-        uint8_t* chunk = simplegc_raw_alloc(chunkSize);
+        uint8_t* chunk = simplegc_raw_alloc(targetArena, chunkSize);
         if (chunk == nullptr)
         {
             LOG1("Alloc(size=%zu, flags=0x%x) FAILED", size, flags);
             return nullptr;
         }
 
+        // The request arena is rewound between requests; that means a new
+        // request reuses memory previously written by an earlier request. The
+        // runtime expects allocation contexts to be zero-initialized memory
+        // when GC_ALLOC_ZEROING_OPTIONAL is set on the requesting allocation
+        // (the runtime will skip its own zeroing in that case). For the perm
+        // arena this is automatic (VirtualAlloc gives zeros and we never
+        // re-allocate), but for the request arena we must zero stale bytes.
+        if (&targetArena == &g_request)
+        {
+            memset(chunk, 0, chunkSize);
+        }
+
+        g_requestedBytes.fetch_add(size, std::memory_order_relaxed);
+
+        // Cache the alloc context pointer so request_end can flush it without
+        // walking all alloc contexts. Single-threaded benchmark assumption.
+        if (acontext != nullptr)
+        {
+            t_lastAllocCtx = acontext;
+        }
+
         static int s_traceCount = 0;
         if (s_traceCount++ < 20)
         {
-            LOG1("Alloc[%d] size=%zu flags=0x%x -> %p", s_traceCount, size, flags, chunk);
+            LOG1("Alloc[%d] size=%zu flags=0x%x arena=%s -> %p (acontext=%p)",
+                 s_traceCount, size, flags,
+                 (&targetArena == &g_request) ? "request" : "perm",
+                 chunk, acontext);
         }
 
         // Object goes at the beginning of the chunk.
@@ -573,6 +782,9 @@ public:
             acontext->alloc_ptr   = chunk + size;
             acontext->alloc_limit = chunk + chunkSize;
             acontext->alloc_bytes += (int64_t)size;
+            // Note: ee_alloc_context::combined_limit (offset -8 from acontext)
+            // is updated by the runtime's slow path after we return, based on
+            // alloc_limit. We don't need to touch it here.
         }
         return obj;
     }
@@ -640,7 +852,9 @@ public:
     unsigned int GetGenerationWithRange(Object*, uint8_t** ppStart, uint8_t** ppAllocated, uint8_t** ppReserved) override
     {
         if (ppStart)     *ppStart     = g_heapStart;
-        if (ppAllocated) *ppAllocated = g_bumpPtr;
+        // Allocated high-water = max of perm.bump and request.bump (we can't
+        // sensibly report two ranges through this single accessor).
+        if (ppAllocated) *ppAllocated = (g_request.bump > g_perm.bump) ? g_request.bump : g_perm.bump;
         if (ppReserved)  *ppReserved  = g_heapEnd;
         return 0;
     }
@@ -726,6 +940,168 @@ GC_Initialize(IGCToCLR* clrToGC,
 
     LOG1("GC_Initialize complete");
     return S_OK;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3: managed strategy bridge — public C ABI
+// ---------------------------------------------------------------------------
+//
+// The application registers a function pointer for ShouldCollect via the
+// simplegc_register_strategy export. The pointer is then called from the
+// allocation slow path (BEFORE the next chunk refill) on the managed thread
+// after a transition to preemptive GC mode.
+//
+// Constraints communicated to strategy authors:
+//   1. The callback must be a [UnmanagedCallersOnly] static method.
+//   2. It must NOT allocate (no new objects, no boxing, no string formatting).
+//   3. It must be JIT'd and its containing type's .cctor must have run BEFORE
+//      registration (the app should call RuntimeHelpers.PrepareMethod and
+//      RuntimeHelpers.RunClassConstructor first).
+//   4. It must not throw.
+//   5. Returning non-zero approves a collection; we currently log it but
+//      don't yet collect (Phase 4).
+
+GC_EXPORT
+uint32_t LOCALGC_CALLCONV
+simplegc_register_strategy(uint32_t abiVersion,
+                           uint32_t structSize,
+                           ShouldCollectFn shouldCollect)
+{
+    if (abiVersion != kStrategyAbiVersion)
+    {
+        LOG1("simplegc_register_strategy: ABI version mismatch (got %u, expected %u)",
+             abiVersion, kStrategyAbiVersion);
+        return 0;
+    }
+    if (structSize != sizeof(SimpleGCStats))
+    {
+        LOG1("simplegc_register_strategy: struct size mismatch (got %u, expected %zu)",
+             structSize, sizeof(SimpleGCStats));
+        return 0;
+    }
+
+    g_shouldCollect.store(shouldCollect, std::memory_order_release);
+    LOG1("simplegc_register_strategy: shouldCollect=%p", shouldCollect);
+    return kStrategyAbiVersion;
+}
+
+GC_EXPORT
+void LOCALGC_CALLCONV
+simplegc_get_telemetry(uint64_t* outConsultCount,
+                       uint64_t* outApprovedCount,
+                       uint64_t* outGcCount,
+                       uint64_t* outTotalAllocatedBytes,
+                       uint64_t* outRequestedBytes,
+                       uint64_t* outObjectCount)
+{
+    if (outConsultCount       != nullptr) *outConsultCount       = g_consultCount.load(std::memory_order_relaxed);
+    if (outApprovedCount      != nullptr) *outApprovedCount      = g_strategyApprovedGCs.load(std::memory_order_relaxed);
+    if (outGcCount            != nullptr) *outGcCount            = g_gcCount.load(std::memory_order_relaxed);
+    if (outTotalAllocatedBytes!= nullptr) *outTotalAllocatedBytes= g_totalAllocated.load(std::memory_order_relaxed);
+    if (outRequestedBytes     != nullptr) *outRequestedBytes     = g_requestedBytes.load(std::memory_order_relaxed);
+    if (outObjectCount        != nullptr) *outObjectCount        = g_objectCount.load(std::memory_order_relaxed);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4: per-request arena - public C ABI
+// ---------------------------------------------------------------------------
+//
+// The application brackets a unit of work (e.g. a webapi request) with calls
+// to simplegc_request_begin() and simplegc_request_end(). All allocations made
+// while inside the bracket are routed to the request arena, and request_end
+// rewinds the arena's bump pointer in O(1) — every object allocated in the
+// bracket is reclaimed simultaneously.
+//
+// Hard contract for the caller:
+//   * No managed reference into request-arena objects must outlive request_end.
+//     This means: no static fields, no fields of perm-arena objects, nothing
+//     captured by closures that live longer than the request.
+//   * For the prototype the caller is responsible for nulling out their own
+//     references before request_end. A real integration would enforce this at
+//     compile time (the LLM-strategy story) or with runtime escape analysis.
+//
+// Currently single-threaded: t_activeArena and t_lastAllocCtx are thread-local;
+// only the calling thread is affected. Multi-threaded bracket support requires
+// per-thread request arenas plus EE suspension on flush — out of scope here.
+
+GC_EXPORT
+uint64_t LOCALGC_CALLCONV
+simplegc_request_begin()
+{
+    if (t_activeArena == &g_request)
+    {
+        // Already inside a request. Nested begins are not supported.
+        LOG1("simplegc_request_begin: nested call ignored");
+        return 0;
+    }
+
+    // Snapshot the current bump position so request_end can rewind to here.
+    {
+        std::lock_guard<std::mutex> guard(g_request.lock);
+        g_request.checkpoint = g_request.bump;
+    }
+    t_activeArena = &g_request;
+
+    // Force the next allocation to refill from the request arena by zeroing
+    // out the cached alloc context's pointers. Without this, the runtime's
+    // fast path would keep bumping in whichever chunk the perm arena gave us
+    // last.
+    // Flush the alloc-context cache (combined_limit + alloc_ptr + alloc_limit)
+    // so the very next allocation falls into our slow-path Alloc and refills
+    // a fresh chunk from the request arena.
+    simplegc_flush_alloc_context(t_lastAllocCtx);
+
+    return (uint64_t)(uintptr_t)g_request.checkpoint;
+}
+
+GC_EXPORT
+uint64_t LOCALGC_CALLCONV
+simplegc_request_end()
+{
+    if (t_activeArena != &g_request)
+    {
+        LOG1("simplegc_request_end: no active request");
+        return 0;
+    }
+
+    uint64_t freedBytes = 0;
+    {
+        std::lock_guard<std::mutex> guard(g_request.lock);
+        freedBytes = (uint64_t)(g_request.bump - g_request.checkpoint);
+        // O(1) "collection": rewind bump pointer. All objects above are gone.
+        // DEBUG: optionally disable rewind to bisect arena-vs-rewind bugs.
+        static bool s_disableRewind = []() {
+            const char* v = std::getenv("SIMPLEGC_NO_REWIND");
+            return v != nullptr && v[0] == '1';
+        }();
+        if (!s_disableRewind)
+        {
+            g_request.bump = g_request.checkpoint;
+        }
+    }
+    t_activeArena = nullptr;
+
+    // Flush the alloc context cache (combined_limit + alloc_ptr + alloc_limit)
+    // so the very next allocation falls into our slow-path Alloc. Without
+    // this, the runtime's fast path would keep bumping in the freshly-rewound
+    // region of the request arena and "allocate" into reclaimed memory.
+    simplegc_flush_alloc_context(t_lastAllocCtx);
+
+    g_gcCount.fetch_add(1, std::memory_order_relaxed);
+    return freedBytes;
+}
+
+GC_EXPORT
+void LOCALGC_CALLCONV
+simplegc_get_arena_stats(uint64_t* outPermBytesUsed,
+                         uint64_t* outPermBytesCommitted,
+                         uint64_t* outRequestBytesUsed,
+                         uint64_t* outRequestBytesCommitted)
+{
+    if (outPermBytesUsed)         *outPermBytesUsed         = (uint64_t)(g_perm.bump - g_perm.start);
+    if (outPermBytesCommitted)    *outPermBytesCommitted    = (uint64_t)(g_perm.committed - g_perm.start);
+    if (outRequestBytesUsed)      *outRequestBytesUsed      = (uint64_t)(g_request.bump - g_request.start);
+    if (outRequestBytesCommitted) *outRequestBytesCommitted = (uint64_t)(g_request.committed - g_request.start);
 }
 
 // ---------------------------------------------------------------------------

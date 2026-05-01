@@ -2,8 +2,8 @@
   <PropertyGroup>
     <OutputType>Exe</OutputType>
     <TargetFramework>net11.0</TargetFramework>
-    <RootNamespace>SimpleGCHello</RootNamespace>
-    <AssemblyName>hello</AssemblyName>
+    <RootNamespace>SimpleGCWebApiBench</RootNamespace>
+    <AssemblyName>webapi-bench</AssemblyName>
     <Nullable>disable</Nullable>
     <NoWarn>$(NoWarn);CA1050;CA1852;SA1400;IDE0073</NoWarn>
     <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
@@ -12,7 +12,6 @@
     <RunCodeAnalysis>false</RunCodeAnalysis>
     <EnforceCodeStyleInBuild>false</EnforceCodeStyleInBuild>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <ServerGarbageCollection>false</ServerGarbageCollection>
   </PropertyGroup>
-  <ItemGroup>
-  </ItemGroup>
 </Project>
