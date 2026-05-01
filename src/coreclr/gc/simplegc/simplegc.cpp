@@ -45,9 +45,19 @@
 #define SIMPLEGC_TRACE 1
 #endif
 
+// Runtime override for trace level. Read once on the first log call from the
+// SIMPLEGC_LOG env var so the bench can dial logging up or down without a
+// rebuild. -1 means "uninitialized; check env var on next call".
+static int g_simplegcTraceLevel = -1;
+
 static void simplegc_log(int level, const char* fmt, ...)
 {
-    if (level > SIMPLEGC_TRACE) return;
+    if (g_simplegcTraceLevel < 0)
+    {
+        const char* v = std::getenv("SIMPLEGC_LOG");
+        g_simplegcTraceLevel = v ? std::atoi(v) : SIMPLEGC_TRACE;
+    }
+    if (level > g_simplegcTraceLevel) return;
     va_list args;
     va_start(args, fmt);
     fprintf(stderr, "[simplegc] ");
