@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net11.0</TargetFramework>
+    <RootNamespace>SimpleGCHello</RootNamespace>
+    <AssemblyName>hello</AssemblyName>
+    <Nullable>disable</Nullable>
+    <NoWarn>$(NoWarn);CA1050;CA1852;SA1400;IDE0073</NoWarn>
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+    <RunAnalyzers>false</RunAnalyzers>
+    <EnableNETAnalyzers>false</EnableNETAnalyzers>
+    <RunCodeAnalysis>false</RunCodeAnalysis>
+    <EnforceCodeStyleInBuild>false</EnforceCodeStyleInBuild>
+  </PropertyGroup>
+  <ItemGroup>
+  </ItemGroup>
+</Project>

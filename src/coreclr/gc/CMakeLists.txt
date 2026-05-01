@@ -154,4 +154,8 @@ if(FEATURE_STANDALONE_GC)
   if (CLR_CMAKE_TARGET_ARCH_ARM64 OR CLR_CMAKE_TARGET_ARCH_AMD64)
     install_clr(TARGETS clrgcexp DESTINATIONS . sharedFramework COMPONENT runtime)
   endif (CLR_CMAKE_TARGET_ARCH_ARM64 OR CLR_CMAKE_TARGET_ARCH_AMD64)
+
+  # SimpleGC: from-scratch minimal standalone GC for the LLM-generated GC prototype.
+  # Builds as a standalone DLL alongside clrgc / clrgcexp.
+  add_subdirectory(simplegc)
 endif(FEATURE_STANDALONE_GC)
