@@ -162,6 +162,12 @@ namespace
     // simplegc_route_to_marksweep export.
     thread_local bool t_useMarkSweep = false;
 
+    // Per-thread "auto-route" flag. When set, the slow-path Alloc consults
+    // the dominant MT in the just-flushed chunk (post-hoc walk) and adjusts
+    // routing for the NEXT chunk based on that MT's recommended route.
+    // Driven by simplegc_enable_auto_routing(int).
+    thread_local bool t_autoRoute = false;
+
     // Overall VirtualReserve range (perm.start .. request.end). Used by
     // IsHeapPointer / RegisterFrozenSegment etc. that want to know "is this
     // anywhere in our managed heap?"
@@ -250,7 +256,30 @@ namespace
         std::atomic<uint64_t>     bytes;
         std::atomic<uint32_t>     min_size;
         std::atomic<uint32_t>     max_size;
+        // ---- Adaptive routing (post-M1b) -------------------------------
+        // Survival counters: populated during mark-phase walk. Reset at the
+        // start of each mark-sweep so they reflect THIS collection's
+        // survival, not a running total.
+        std::atomic<uint64_t>     bytes_survived;
+        std::atomic<uint64_t>     count_survived;
+        // Number of mark-sweep collections this MT had any surviving objects.
+        // Bumped after each collection where count_survived > 0.
+        std::atomic<uint32_t>     age_collections;
+        // Routing decision written by the managed policy callback (or by
+        // simplegc_set_route directly). Read by Alloc on the slow path.
+        //   0 = Default (perm/request fast path)
+        //   1 = ForcePerm
+        //   2 = ForceRequest (only honored if a request bracket is open)
+        //   3 = MarkSweep
+        std::atomic<uint8_t>      route;
     };
+    static_assert(sizeof(std::atomic<uint8_t>) == 1, "atomic<uint8_t> must be 1 byte");
+
+    // Route values exposed through the public ABI; mirrored in C# as enum.
+    constexpr uint8_t kRouteDefault    = 0;
+    constexpr uint8_t kRouteForcePerm  = 1;
+    constexpr uint8_t kRouteForceReq   = 2;
+    constexpr uint8_t kRouteMarkSweep  = 3;
 
     SimpleGCMTEntry        g_mtTable[kMtTableCapacity];
     std::atomic<uint64_t>  g_mtAttributedObjects{0};
@@ -270,6 +299,11 @@ namespace
     // attribute objects to their MTs.
     thread_local uint8_t* t_chunkStart = nullptr;
     thread_local uint8_t* t_chunkEnd   = nullptr;
+
+    // Per-route byte tally accumulated during a single mt_walk_chunk pass.
+    // Reset at the start of each walk; consulted at the end if t_autoRoute
+    // is enabled to decide whether to flip the thread's routing flags.
+    thread_local uint64_t t_routeTally[4] = {0, 0, 0, 0};
 }
 
 // Public ABI struct exposed via simplegc_get_mt_stats. ABI version + size are
@@ -297,6 +331,9 @@ namespace
     }
 
     // Lock-free find-or-insert + update.
+    // Also accumulates `size` into the per-thread route tally bucket
+    // corresponding to this MT's current routing decision; the tally is
+    // consulted by simplegc_attribute_pending for auto-routing.
     static void mt_record(MethodTable* mt, uint32_t size)
     {
         size_t h = mt_hash(mt);
@@ -315,6 +352,8 @@ namespace
                 uint32_t mx = e.max_size.load(std::memory_order_relaxed);
                 while (size > mx &&
                        !e.max_size.compare_exchange_weak(mx, size, std::memory_order_relaxed)) {}
+                uint8_t r = e.route.load(std::memory_order_relaxed);
+                if (r < 4) t_routeTally[r] += size;
                 return;
             }
             if (cur == nullptr)
@@ -328,19 +367,20 @@ namespace
                     e.min_size.store(size, std::memory_order_relaxed);
                     e.max_size.store(size, std::memory_order_relaxed);
                     g_mtTableUsed.fetch_add(1, std::memory_order_relaxed);
+                    // New entry → route is default; tally into bucket 0.
+                    t_routeTally[kRouteDefault] += size;
                     return;
                 }
-                // Lost the race; if the winner wrote our MT, just update.
                 if (expected == mt)
                 {
                     e.count.fetch_add(1, std::memory_order_relaxed);
                     e.bytes.fetch_add(size, std::memory_order_relaxed);
+                    uint8_t r = e.route.load(std::memory_order_relaxed);
+                    if (r < 4) t_routeTally[r] += size;
                     return;
                 }
-                // Else fall through to next probe.
             }
         }
-        // Table full — drop. Bump overflow counter for diagnostics.
         g_mtOverflowObjects.fetch_add(1, std::memory_order_relaxed);
     }
 
@@ -456,7 +496,55 @@ namespace
             // simplegc_flush_alloc_context zeroed alloc_ptr we'll skip.
             if (alloc_ptr > t_chunkStart && alloc_ptr <= t_chunkEnd)
             {
+                // Reset the per-route byte tally; mt_record will populate it
+                // as we walk.
+                t_routeTally[0] = t_routeTally[1] = t_routeTally[2] = t_routeTally[3] = 0;
                 mt_walk_chunk(t_chunkStart, alloc_ptr);
+
+                // Auto-routing: if the dominant route in the just-walked
+                // chunk is non-default and accounts for >= 60% of attributed
+                // bytes, flip the thread's routing flags for the next chunk.
+                if (t_autoRoute)
+                {
+                    uint64_t total = t_routeTally[0] + t_routeTally[1] +
+                                     t_routeTally[2] + t_routeTally[3];
+                    if (total >= 1024)
+                    {
+                        // Find dominant non-default bucket.
+                        uint8_t  best  = kRouteDefault;
+                        uint64_t bestB = t_routeTally[kRouteDefault];
+                        for (uint8_t r = 1; r < 4; ++r)
+                        {
+                            if (t_routeTally[r] > bestB)
+                            {
+                                bestB = t_routeTally[r];
+                                best  = r;
+                            }
+                        }
+                        // Threshold: 60% of total bytes.
+                        if (bestB * 5 >= total * 3)
+                        {
+                            switch (best)
+                            {
+                            case kRouteMarkSweep:
+                                t_useMarkSweep = true;
+                                break;
+                            case kRouteForcePerm:
+                                t_useMarkSweep = false;
+                                t_activeArena  = nullptr; // perm
+                                break;
+                            case kRouteForceReq:
+                                t_useMarkSweep = false;
+                                // t_activeArena left as-is; honored only if
+                                // a request bracket has set it to &g_request.
+                                break;
+                            default:
+                                t_useMarkSweep = false;
+                                break;
+                            }
+                        }
+                    }
+                }
             }
         }
         t_chunkStart = nullptr;
@@ -1007,8 +1095,48 @@ namespace
     // the simplegc_handles namespace is introduced) but declared here.
     void ms_scan_handle_store();
 
+    // Bump survival counters on the MT entry for `mt` by `size` bytes / 1 obj.
+    // Adds the entry if missing (we want survival data even for MTs we didn't
+    // observe at allocation time, e.g. types allocated before tracking was
+    // enabled).
+    static void mt_record_survived(MethodTable* mt, uint32_t size)
+    {
+        size_t h = mt_hash(mt);
+        for (size_t i = 0; i < kMtTableCapacity; ++i)
+        {
+            size_t idx = (h + i) & (kMtTableCapacity - 1);
+            SimpleGCMTEntry& e = g_mtTable[idx];
+            MethodTable* cur = e.mt.load(std::memory_order_acquire);
+            if (cur == mt)
+            {
+                e.count_survived.fetch_add(1, std::memory_order_relaxed);
+                e.bytes_survived.fetch_add(size, std::memory_order_relaxed);
+                return;
+            }
+            if (cur == nullptr)
+            {
+                MethodTable* expected = nullptr;
+                if (e.mt.compare_exchange_strong(expected, mt,
+                        std::memory_order_acq_rel, std::memory_order_acquire))
+                {
+                    e.count_survived.store(1, std::memory_order_relaxed);
+                    e.bytes_survived.store(size, std::memory_order_relaxed);
+                    g_mtTableUsed.fetch_add(1, std::memory_order_relaxed);
+                    return;
+                }
+                if (expected == mt)
+                {
+                    e.count_survived.fetch_add(1, std::memory_order_relaxed);
+                    e.bytes_survived.fetch_add(size, std::memory_order_relaxed);
+                    return;
+                }
+            }
+        }
+    }
+
     // Drain the gray queue: for each marked-but-unscanned object, walk its
     // reference fields and mark+enqueue every ref that lies in our region.
+    // Also bumps per-MT survival counters for the policy engine.
     static void ms_drain_gray_queue()
     {
         while (!g_grayQueue.empty())
@@ -1018,6 +1146,7 @@ namespace
             MethodTable* mt = *reinterpret_cast<MethodTable**>(obj);
             if (mt == nullptr || mt == g_gc_pFreeObjectMethodTable) continue;
             size_t size = simplegc_obj_size(mt, obj);
+            mt_record_survived(mt, (uint32_t)size);
             ms_walk_object_refs(mt, obj, size);
         }
     }
@@ -1740,39 +1869,73 @@ static SimpleHandleManager* g_simpleHandleMgr = nullptr;
 // can call it).
 // ---------------------------------------------------------------------------
 
+// Forward declaration: routing-policy callback dispatcher (Step C).
+static void simplegc_invoke_routing_policy_post_collect();
+
 HRESULT simplegc_force_collect()
 {
     if (g_simpleHeap == nullptr) return S_OK;
     if (g_marksweep.start_obj == nullptr) return S_OK;
 
-    // Bracket: only one collection at a time.
-    std::lock_guard<std::mutex> guard(g_marksweep.lock);
+    {
+        // Bracket: only one collection at a time.
+        std::lock_guard<std::mutex> guard(g_marksweep.lock);
 
-    // Suspend the EE so we can scan stacks safely. The runtime guarantees
-    // every thread is at a safe point on return.
-    GCToEEInterface::SuspendEE(SUSPEND_FOR_GC);
+        // Suspend the EE so we can scan stacks safely. The runtime guarantees
+        // every thread is at a safe point on return.
+        GCToEEInterface::SuspendEE(SUSPEND_FOR_GC);
 
-    // Clear mark bits and gray queue.
-    memset(g_marksweep.mark_bits, 0, g_marksweep.mark_bits_size);
-    g_grayQueue.clear();
+        // Reset per-collection survival counters on every populated MT entry. The
+        // mark phase will re-populate them. Cumulative counters (count, bytes)
+        // are NOT reset here.
+        for (size_t i = 0; i < kMtTableCapacity; ++i)
+        {
+            if (g_mtTable[i].mt.load(std::memory_order_relaxed) != nullptr)
+            {
+                g_mtTable[i].bytes_survived.store(0, std::memory_order_relaxed);
+                g_mtTable[i].count_survived.store(0, std::memory_order_relaxed);
+            }
+        }
 
-    // Collect roots from managed stacks, statics, and runtime-internal sources.
-    ScanContext sc{};
-    sc.promotion = TRUE;
-    sc.concurrent = FALSE;
-    GCToEEInterface::GcScanRoots(&ms_promote_callback, /*condemned*/ 2, /*max_gen*/ 2, &sc);
+        // Clear mark bits and gray queue.
+        memset(g_marksweep.mark_bits, 0, g_marksweep.mark_bits_size);
+        g_grayQueue.clear();
 
-    // Add our own handle store as roots.
-    ms_scan_handle_store();
+        // Collect roots from managed stacks, statics, and runtime-internal sources.
+        ScanContext sc{};
+        sc.promotion = TRUE;
+        sc.concurrent = FALSE;
+        GCToEEInterface::GcScanRoots(&ms_promote_callback, /*condemned*/ 2, /*max_gen*/ 2, &sc);
 
-    // Trace the live closure.
-    ms_drain_gray_queue();
+        // Add our own handle store as roots.
+        ms_scan_handle_store();
 
-    // Sweep dead objects into the freelist.
-    uint64_t live = ms_sweep_locked();
-    (void)live;
+        // Trace the live closure (also bumps per-MT survival).
+        ms_drain_gray_queue();
 
-    GCToEEInterface::RestartEE(/*bFinishedGC*/ true);
+        // Sweep dead objects into the freelist.
+        uint64_t live = ms_sweep_locked();
+        (void)live;
+
+        // Bump age_collections for every MT that had any survivors this cycle.
+        for (size_t i = 0; i < kMtTableCapacity; ++i)
+        {
+            if (g_mtTable[i].mt.load(std::memory_order_relaxed) != nullptr &&
+                g_mtTable[i].count_survived.load(std::memory_order_relaxed) > 0)
+            {
+                g_mtTable[i].age_collections.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+
+        GCToEEInterface::RestartEE(/*bFinishedGC*/ true);
+    }   // <-- release g_marksweep.lock BEFORE invoking the managed callback.
+
+    // Invoke the registered routing-policy callback (if any). Runs OUTSIDE
+    // both the suspended-EE bracket AND the marksweep lock — so the
+    // callback (and its reverse-P/Invoke transition) may freely allocate
+    // (which itself acquires g_marksweep.lock) without recursing on a
+    // non-recursive mutex.
+    simplegc_invoke_routing_policy_post_collect();
 
     return S_OK;
 }
@@ -2161,6 +2324,173 @@ HRESULT LOCALGC_CALLCONV
 simplegc_collect_marksweep()
 {
     return simplegc_force_collect();
+}
+
+// ---------------------------------------------------------------------------
+// Adaptive routing: per-MT route field + managed policy callback ABI
+// ---------------------------------------------------------------------------
+//
+// The managed policy reads a snapshot of per-MT data (alloc bytes/count,
+// last-collection survivors, age) and writes back routing decisions via
+// simplegc_set_route. The callback runs at the END of simplegc_force_collect,
+// AFTER RestartEE — so it may allocate, log, and use rich logic. A bad policy
+// can produce bad routing (= bad performance) but never breaks correctness:
+// region implementations are independent of policy choices.
+//
+// Snapshot ABI is append-only with a version constant.
+
+constexpr uint32_t kRoutingPolicyAbiVersion = 1;
+
+struct SimpleGCRoutingEntry
+{
+    uint64_t mt_token;          // MethodTable* as opaque uint64
+    uint64_t alloc_count;       // cumulative # of objects ever allocated
+    uint64_t alloc_bytes;       // cumulative bytes ever allocated
+    uint64_t survived_count;    // objects surviving the most recent collection
+    uint64_t survived_bytes;    // bytes surviving the most recent collection
+    uint32_t age_collections;   // # of collections this MT had any survivors
+    uint32_t min_size;
+    uint32_t max_size;
+    uint8_t  current_route;     // current routing decision
+    uint8_t  _pad0;
+    uint16_t _pad1;
+};
+static_assert(sizeof(SimpleGCRoutingEntry) == 56, "SimpleGCRoutingEntry ABI");
+
+// RoutingPolicyFn is invoked post-collection. The callback walks the snapshot
+// it pulls via simplegc_get_routing_snapshot (allocating its own buffer) and
+// writes back via simplegc_set_route. The callback is itself void-returning
+// because a bad policy cannot fail meaningfully — failures degrade to "no
+// routing change this cycle".
+typedef void (LOCALGC_CALLCONV *RoutingPolicyFn)();
+
+static std::atomic<RoutingPolicyFn> g_routingPolicy{nullptr};
+
+GC_EXPORT
+uint32_t LOCALGC_CALLCONV
+simplegc_register_routing_policy(uint32_t abiVersion, RoutingPolicyFn cb)
+{
+    if (abiVersion != kRoutingPolicyAbiVersion)
+    {
+        LOG1("simplegc_register_routing_policy: ABI version mismatch (got %u, expected %u)",
+             abiVersion, kRoutingPolicyAbiVersion);
+        return 0;
+    }
+    g_routingPolicy.store(cb, std::memory_order_release);
+    LOG1("simplegc_register_routing_policy: cb=%p", cb);
+    return kRoutingPolicyAbiVersion;
+}
+
+// Fill `buffer` with up to `capacity` populated entries from the MT table.
+// Returns the total number of populated entries (which may exceed capacity;
+// caller can re-call with a larger buffer).
+GC_EXPORT
+uint32_t LOCALGC_CALLCONV
+simplegc_get_routing_snapshot(SimpleGCRoutingEntry* buffer, uint32_t capacity)
+{
+    uint32_t total = 0;
+    uint32_t emitted = 0;
+    for (size_t i = 0; i < kMtTableCapacity; ++i)
+    {
+        SimpleGCMTEntry& e = g_mtTable[i];
+        MethodTable* mt = e.mt.load(std::memory_order_relaxed);
+        if (mt == nullptr) continue;
+        ++total;
+        if (buffer != nullptr && emitted < capacity)
+        {
+            SimpleGCRoutingEntry& out = buffer[emitted++];
+            out.mt_token        = (uint64_t)mt;
+            out.alloc_count     = e.count.load(std::memory_order_relaxed);
+            out.alloc_bytes     = e.bytes.load(std::memory_order_relaxed);
+            out.survived_count  = e.count_survived.load(std::memory_order_relaxed);
+            out.survived_bytes  = e.bytes_survived.load(std::memory_order_relaxed);
+            out.age_collections = e.age_collections.load(std::memory_order_relaxed);
+            out.min_size        = e.min_size.load(std::memory_order_relaxed);
+            out.max_size        = e.max_size.load(std::memory_order_relaxed);
+            out.current_route   = e.route.load(std::memory_order_relaxed);
+            out._pad0 = 0;
+            out._pad1 = 0;
+        }
+    }
+    return total;
+}
+
+// Write a routing decision for the MT identified by `mt_token`. Returns 1 on
+// success, 0 if the MT is not present in the table. The route takes effect
+// on the next slow-path Alloc that observes objects of this MT in its
+// just-finished chunk (auto-routing) OR immediately for direct callers that
+// also use simplegc_route_to_marksweep.
+GC_EXPORT
+uint32_t LOCALGC_CALLCONV
+simplegc_set_route(uint64_t mt_token, uint8_t route)
+{
+    if (mt_token == 0) return 0;
+    if (route > kRouteMarkSweep) return 0;
+    MethodTable* mt = (MethodTable*)mt_token;
+    size_t h = mt_hash(mt);
+    for (size_t i = 0; i < kMtTableCapacity; ++i)
+    {
+        size_t idx = (h + i) & (kMtTableCapacity - 1);
+        SimpleGCMTEntry& e = g_mtTable[idx];
+        MethodTable* cur = e.mt.load(std::memory_order_acquire);
+        if (cur == mt)
+        {
+            e.route.store(route, std::memory_order_release);
+            return 1;
+        }
+        if (cur == nullptr)
+        {
+            return 0;
+        }
+    }
+    return 0;
+}
+
+GC_EXPORT
+uint8_t LOCALGC_CALLCONV
+simplegc_get_route(uint64_t mt_token)
+{
+    if (mt_token == 0) return kRouteDefault;
+    MethodTable* mt = (MethodTable*)mt_token;
+    size_t h = mt_hash(mt);
+    for (size_t i = 0; i < kMtTableCapacity; ++i)
+    {
+        size_t idx = (h + i) & (kMtTableCapacity - 1);
+        SimpleGCMTEntry& e = g_mtTable[idx];
+        MethodTable* cur = e.mt.load(std::memory_order_acquire);
+        if (cur == mt)
+        {
+            return e.route.load(std::memory_order_acquire);
+        }
+        if (cur == nullptr)
+        {
+            return kRouteDefault;
+        }
+    }
+    return kRouteDefault;
+}
+
+GC_EXPORT
+void LOCALGC_CALLCONV
+simplegc_enable_auto_routing(int32_t enable)
+{
+    t_autoRoute = (enable != 0);
+}
+
+GC_EXPORT
+int32_t LOCALGC_CALLCONV
+simplegc_is_auto_routing_enabled()
+{
+    return t_autoRoute ? 1 : 0;
+}
+
+// Invoked at the end of simplegc_force_collect, AFTER RestartEE. The callback
+// runs in normal cooperative mode and may allocate / log freely.
+static void simplegc_invoke_routing_policy_post_collect()
+{
+    RoutingPolicyFn cb = g_routingPolicy.load(std::memory_order_acquire);
+    if (cb == nullptr) return;
+    cb();
 }
 
 // ---------------------------------------------------------------------------
