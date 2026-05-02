@@ -159,7 +159,8 @@ namespace
 
     // Per-thread routing flag. When true, Alloc routes the next allocation
     // into the mark-sweep region instead of t_activeArena/perm. Set via the
-    // simplegc_route_to_marksweep export.
+    // simplegc_route_to_marksweep export. (Legacy single-bit; superseded by
+    // t_forceRoute below for new code, kept working for back-compat.)
     thread_local bool t_useMarkSweep = false;
 
     // Per-thread "auto-route" flag. When set, the slow-path Alloc consults
@@ -167,6 +168,21 @@ namespace
     // routing for the NEXT chunk based on that MT's recommended route.
     // Driven by simplegc_enable_auto_routing(int).
     thread_local bool t_autoRoute = false;
+
+    // Per-thread forced route (M1c). Higher priority than t_useMarkSweep.
+    // Value is one of kRouteDefault / kRouteForcePerm / kRouteForceReq /
+    // kRouteMarkSweep. kRouteDefault means "no override; fall through to
+    // t_useMarkSweep / g_defaultRoute / arena selection". Set via the
+    // simplegc_set_thread_route export — used by policy-aware workloads
+    // to bracket specific allocation sites.
+    thread_local uint8_t t_forceRoute = 0; // kRouteDefault
+
+    // Global default route (M1c). When non-zero, Alloc consults this AFTER
+    // the per-thread overrides and the request bracket and uses it to drive
+    // routing for any allocation that hasn't been forced elsewhere. This
+    // lets a workload say "everything goes to mark-sweep by default" without
+    // a per-frame thread bracket. Set via simplegc_set_default_route.
+    std::atomic<uint8_t> g_defaultRoute{0}; // kRouteDefault
 
     // Overall VirtualReserve range (perm.start .. request.end). Used by
     // IsHeapPointer / RegisterFrozenSegment etc. that want to know "is this
@@ -1672,7 +1688,43 @@ public:
             GC_ALLOC_FINALIZE | GC_ALLOC_LARGE_OBJECT_HEAP | GC_ALLOC_PINNED_OBJECT_HEAP;
         bool forcePerm = (flags & kAlwaysPermFlags) != 0;
 
-        if (t_useMarkSweep && !forcePerm)
+        // M1c: resolve the EFFECTIVE route for this allocation. Priority:
+        //   1. forcePerm flags (LOH/POH/Final)            → kRouteForcePerm
+        //   2. per-thread forced route (t_forceRoute)     → that route
+        //   3. legacy per-thread t_useMarkSweep flag      → kRouteMarkSweep
+        //   4. request-bracket arena (t_activeArena)      → kRouteForceReq
+        //   5. global default route (g_defaultRoute)      → that route
+        //   6. fallback                                   → kRouteForcePerm
+        //
+        // Putting the request bracket ahead of the global default preserves
+        // the existing semantics for code that uses simplegc_request_begin/end:
+        // a request bracket is a per-call-site contract that the caller has
+        // already opted into and shouldn't be silently overridden by a
+        // process-wide "default to mark-sweep".
+        uint8_t effRoute;
+        if (forcePerm)
+        {
+            effRoute = kRouteForcePerm;
+        }
+        else if (t_forceRoute != kRouteDefault)
+        {
+            effRoute = t_forceRoute;
+        }
+        else if (t_useMarkSweep)
+        {
+            effRoute = kRouteMarkSweep;
+        }
+        else if (t_activeArena != nullptr)
+        {
+            effRoute = kRouteForceReq;
+        }
+        else
+        {
+            uint8_t globalDef = g_defaultRoute.load(std::memory_order_relaxed);
+            effRoute = (globalDef != kRouteDefault) ? globalDef : kRouteForcePerm;
+        }
+
+        if (effRoute == kRouteMarkSweep)
         {
             // Mark-sweep allocation: single-object, exact size. Try freelist
             // first, then bump.
@@ -1714,7 +1766,11 @@ public:
             return reinterpret_cast<Object*>(slot);
         }
 
-        Arena& targetArena = (t_activeArena != nullptr && !forcePerm) ? *t_activeArena : g_perm;
+        // Bump-pointer (perm or request) path. Force-route caller-overrides
+        // win over the request bracket: kRouteForcePerm always lands in perm
+        // even if a request bracket is active.
+        Arena& targetArena =
+            (effRoute == kRouteForceReq && t_activeArena != nullptr) ? *t_activeArena : g_perm;
 
         size_t chunkSize = (size > kAllocCtxQuant) ? size : kAllocCtxQuant;
         uint8_t* chunk = simplegc_raw_alloc(targetArena, chunkSize);
@@ -2482,6 +2538,44 @@ int32_t LOCALGC_CALLCONV
 simplegc_is_auto_routing_enabled()
 {
     return t_autoRoute ? 1 : 0;
+}
+
+// M1c: global default route. Setting this to a non-zero kRoute* value
+// causes Alloc to route any allocation that has not been forced elsewhere
+// (per-thread t_forceRoute, legacy t_useMarkSweep, request bracket) to
+// the chosen region. Pass kRouteDefault (0) to clear.
+GC_EXPORT
+void LOCALGC_CALLCONV
+simplegc_set_default_route(int32_t route)
+{
+    if (route < 0 || route > kRouteMarkSweep) return;
+    g_defaultRoute.store(static_cast<uint8_t>(route), std::memory_order_release);
+}
+
+GC_EXPORT
+int32_t LOCALGC_CALLCONV
+simplegc_get_default_route()
+{
+    return static_cast<int32_t>(g_defaultRoute.load(std::memory_order_acquire));
+}
+
+// M1c: per-thread forced route. Highest-priority routing override (after
+// the always-perm flags); used by policy-aware workloads to bracket a
+// specific allocation site without affecting other threads. Pass
+// kRouteDefault (0) to clear.
+GC_EXPORT
+void LOCALGC_CALLCONV
+simplegc_set_thread_route(int32_t route)
+{
+    if (route < 0 || route > kRouteMarkSweep) return;
+    t_forceRoute = static_cast<uint8_t>(route);
+}
+
+GC_EXPORT
+int32_t LOCALGC_CALLCONV
+simplegc_get_thread_route()
+{
+    return static_cast<int32_t>(t_forceRoute);
 }
 
 // Invoked at the end of simplegc_force_collect, AFTER RestartEE. The callback
