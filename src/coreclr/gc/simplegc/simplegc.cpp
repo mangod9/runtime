@@ -18,6 +18,7 @@
 #include "common.h"
 #include "gcenv.h"
 #include "gc.h"          // pulls in standalone forwarders for GCToEEInterface
+#include "gcdesc.h"
 #include "objecthandle.h"
 
 #include <atomic>
@@ -81,15 +82,17 @@ namespace
 {
     // Heap parameters. We carve a single 256 MB VirtualReserve into two
     // arenas:
-    //   * perm    (192 MB at low end) - long-lived state, never reset
-    //   * request (64 MB at high end) - reset by simplegc_request_end()
+    //   * perm       (1 GB)   - long-lived state, never reset
+    //   * request    (256 MB) - reset by simplegc_request_end()
+    //   * marksweep  (256 MB) - real STW mark-sweep collected (M1b)
     //
-    // Keeping both within a single reserve lets us continue publishing one
-    // contiguous heap range to the runtime (so write barriers and the card
-    // table cover both arenas without any biasing changes).
+    // Keeping all three within a single reserve lets us continue publishing
+    // one contiguous heap range to the runtime (so write barriers and the
+    // card table cover all arenas without any biasing changes).
     constexpr size_t kPermSize       = 1024 * 1024 * 1024;  // 1 GB
     constexpr size_t kRequestSize    = 256  * 1024 * 1024;  // 256 MB
-    constexpr size_t kHeapSize       = kPermSize + kRequestSize; // 1.25 GB
+    constexpr size_t kMarkSweepSize  = 256  * 1024 * 1024;  // 256 MB
+    constexpr size_t kHeapSize       = kPermSize + kRequestSize + kMarkSweepSize;
     constexpr size_t kCommitGrain    = 16 * 1024 * 1024;
     constexpr size_t kAllocCtxQuant  = 8 * 1024;
 
@@ -106,6 +109,58 @@ namespace
 
     Arena g_perm;
     Arena g_request;
+
+    // ---- M1b: mark-sweep region ---------------------------------------------
+    //
+    // A *third* region in the same VirtualReserve, but with real STW mark-sweep
+    // collection. Per-object allocation only (no chunk-style fast-path bumping)
+    // so the region is fully linearly walkable for the sweep phase.
+    //
+    // M1b constraints (intentional simplifications):
+    //   - References from perm/request to mark-sweep are NOT supported; mark-sweep
+    //     refs must live only on stacks, in mark-sweep itself, or in our handle
+    //     store. Enforced by managed-side test code.
+    //   - Finalizable, LOH/POH allocations always force perm regardless of
+    //     routing.
+    //   - Interior root scan does a linear walk to find the containing object.
+    //   - Single mutex around the whole region (no concurrent allocation).
+    //
+    // Layout: free list is intrusive — each free slot is a g_gc_pFreeObjectMethodTable
+    // array whose first 16 bytes hold {next pointer; size}. We keep the free MT in
+    // place so the slot remains a valid heap object for any walker.
+    struct MarkSweepRegion
+    {
+        std::mutex lock;
+        uint8_t*   start_obj   = nullptr; // first object pointer (after start padding)
+        uint8_t*   end         = nullptr; // reserved end
+        uint8_t*   committed   = nullptr; // first uncommitted byte
+        uint8_t*   bump        = nullptr; // first byte never yet handed out
+
+        // Side bitmap: 1 bit per kMarkBitGranularity bytes of [start_obj, end).
+        uint8_t*   mark_bits   = nullptr;
+        size_t     mark_bits_size = 0;
+
+        // Free list: singly linked, intrusive. The slot pointer IS the free
+        // object pointer; ms_freelist_next/size read from inside the slot.
+        uint8_t*   free_head   = nullptr;
+
+        std::atomic<uint64_t> bytes_allocated{0};
+        std::atomic<uint64_t> bytes_freelist{0};
+        std::atomic<uint64_t> bytes_live_after_collect{0};
+        std::atomic<uint64_t> bytes_collected_total{0};
+        std::atomic<uint64_t> n_collections{0};
+        std::atomic<uint64_t> n_objects_allocated{0};
+        std::atomic<uint64_t> n_objects_swept{0};
+    };
+
+    constexpr size_t kMarkBitGranularity = 8; // 1 bit per 8 bytes of heap
+
+    MarkSweepRegion g_marksweep;
+
+    // Per-thread routing flag. When true, Alloc routes the next allocation
+    // into the mark-sweep region instead of t_activeArena/perm. Set via the
+    // simplegc_route_to_marksweep export.
+    thread_local bool t_useMarkSweep = false;
 
     // Overall VirtualReserve range (perm.start .. request.end). Used by
     // IsHeapPointer / RegisterFrozenSegment etc. that want to know "is this
@@ -506,7 +561,7 @@ static bool simplegc_init_heap()
     g_perm.bump       = g_perm.start;
 
     g_request.start     = g_perm.end;
-    g_request.end       = g_heapEnd;
+    g_request.end       = g_request.start + kRequestSize;
     g_request.committed = g_request.start;
     g_request.bump      = g_request.start;
 
@@ -530,6 +585,32 @@ static bool simplegc_init_heap()
         return false;
     }
     g_request.committed = g_request.start + ((kStartPadding + 4095) & ~static_cast<size_t>(4095));
+
+    // Mark-sweep region: third sub-range of the same VirtualReserve, immediately
+    // after the request arena.
+    uint8_t* msBase = g_request.end;
+    g_marksweep.start_obj = msBase + kStartPadding;
+    g_marksweep.end       = msBase + kMarkSweepSize;
+    g_marksweep.committed = msBase;
+    g_marksweep.bump      = g_marksweep.start_obj;
+    if (!GCToOSInterface::VirtualCommit(msBase, kStartPadding))
+    {
+        LOG1("VirtualCommit(marksweep start padding) failed");
+        return false;
+    }
+    g_marksweep.committed = msBase + ((kStartPadding + 4095) & ~static_cast<size_t>(4095));
+
+    // Side bitmap: 1 bit per kMarkBitGranularity bytes of the data area. We
+    // size it for the FULL reserve so we never need to grow it.
+    g_marksweep.mark_bits_size =
+        (kMarkSweepSize + kMarkBitGranularity * 8 - 1) / (kMarkBitGranularity * 8);
+    g_marksweep.mark_bits = static_cast<uint8_t*>(::malloc(g_marksweep.mark_bits_size));
+    if (g_marksweep.mark_bits == nullptr)
+    {
+        LOG1("malloc(mark_bits=%zu) failed", g_marksweep.mark_bits_size);
+        return false;
+    }
+    memset(g_marksweep.mark_bits, 0, g_marksweep.mark_bits_size);
 
     g_gc_lowest_address  = g_heapStart;
     g_gc_highest_address = g_heapEnd;
@@ -564,8 +645,8 @@ static bool simplegc_init_heap()
     }
 #endif
 
-    LOG1("heap reserved at %p .. %p (perm=%zu MB, request=%zu MB)",
-         g_heapStart, g_heapEnd, kPermSize >> 20, kRequestSize >> 20);
+    LOG1("heap reserved at %p .. %p (perm=%zu MB, request=%zu MB, marksweep=%zu MB)",
+         g_heapStart, g_heapEnd, kPermSize >> 20, kRequestSize >> 20, kMarkSweepSize >> 20);
     return true;
 }
 
@@ -608,6 +689,442 @@ static uint8_t* simplegc_raw_alloc(Arena& arena, size_t size)
 }
 
 // ---------------------------------------------------------------------------
+// M1b: mark-sweep allocation, freelist, and free-object helpers.
+// ---------------------------------------------------------------------------
+//
+// Free-object encoding: a span of N bytes (N >= ms_free_object_min_size())
+// becomes a g_gc_pFreeObjectMethodTable instance whose ArrayBase::m_dwLength
+// stores N - free_object_base_size. The slot remains a valid heap object that
+// any linear walker can step over.
+//
+// Freelist link: stored at offset 16 inside the slot (after MT@0 and length@8).
+// This is past the ArrayBase header so it doesn't disturb the runtime's view
+// of the free object. We only stash it for live free slots (not for free
+// objects used as filler for abandoned alloc-context tails).
+
+static inline uint32_t ms_free_object_base_size()
+{
+    if (g_gc_pFreeObjectMethodTable == nullptr) return 24; // sane fallback
+    return g_gc_pFreeObjectMethodTable->GetBaseSize();
+}
+
+// Minimum sweepable slot. Below this, we cannot create a parseable free object.
+static inline size_t ms_free_object_min_size()
+{
+    return ms_free_object_base_size();
+}
+
+// Write a g_gc_pFreeObjectMethodTable header at p describing a slot of `size`
+// bytes total (including the header). Caller must guarantee size >=
+// ms_free_object_min_size(). Does NOT touch the freelist.
+static void ms_set_free_obj(uint8_t* p, size_t size)
+{
+    assert(g_gc_pFreeObjectMethodTable != nullptr);
+    assert(size >= ms_free_object_min_size());
+    *reinterpret_cast<MethodTable**>(p) = g_gc_pFreeObjectMethodTable;
+    // m_dwLength is a uint32_t at offset sizeof(void*) (= 8 on x64). The
+    // runtime's SetFree writes a size_t there; we follow suit so high bits
+    // are clean if the runtime ever reads it.
+    *reinterpret_cast<size_t*>(p + sizeof(void*)) = size - ms_free_object_base_size();
+}
+
+// Read the size of a slot whose header is a free object MT.
+static size_t ms_read_free_obj_size(uint8_t* p)
+{
+    size_t numComponents = *reinterpret_cast<size_t*>(p + sizeof(void*));
+    return ms_free_object_base_size() + numComponents;
+}
+
+// Freelist link helpers. Link is stored at p + 16 (just past ArrayBase header).
+// Free slot must be at least 24 bytes (handled by min size constraint).
+static inline uint8_t*& ms_freelist_next(uint8_t* p)
+{
+    return *reinterpret_cast<uint8_t**>(p + 16);
+}
+
+// Push a free slot onto the head of the region's freelist. Caller holds
+// g_marksweep.lock.
+static void ms_freelist_push(uint8_t* p, size_t size)
+{
+    ms_set_free_obj(p, size);
+    if (size >= 24)
+    {
+        ms_freelist_next(p) = g_marksweep.free_head;
+        g_marksweep.free_head = p;
+    }
+    g_marksweep.bytes_freelist.fetch_add(size, std::memory_order_relaxed);
+}
+
+// Pop a slot from the freelist that's at least `size` bytes. First-fit search.
+// Returns nullptr if none. Caller holds g_marksweep.lock. On success, the
+// returned slot is removed from the freelist and zeroed. If the slot is
+// larger than needed and the remainder is >= ms_free_object_min_size(), the
+// remainder is re-linked as a smaller free object.
+static uint8_t* ms_freelist_take(size_t size)
+{
+    uint8_t** slot = &g_marksweep.free_head;
+    while (*slot != nullptr)
+    {
+        uint8_t* p = *slot;
+        size_t s = ms_read_free_obj_size(p);
+        if (s >= size)
+        {
+            // Unlink.
+            *slot = ms_freelist_next(p);
+            g_marksweep.bytes_freelist.fetch_sub(s, std::memory_order_relaxed);
+
+            size_t remainder = s - size;
+            if (remainder >= ms_free_object_min_size())
+            {
+                uint8_t* tail = p + size;
+                ms_set_free_obj(tail, remainder);
+                if (remainder >= 24)
+                {
+                    ms_freelist_next(tail) = g_marksweep.free_head;
+                    g_marksweep.free_head = tail;
+                }
+                g_marksweep.bytes_freelist.fetch_add(remainder, std::memory_order_relaxed);
+                s = size;
+            }
+            // Always zero the slot before handing it back. The runtime may
+            // skip its own zeroing when GC_ALLOC_ZEROING_OPTIONAL is set.
+            memset(p, 0, s);
+            return p;
+        }
+        slot = &ms_freelist_next(p);
+    }
+    return nullptr;
+}
+
+// Commit more pages in the mark-sweep region to satisfy bytesNeeded.
+// Caller holds g_marksweep.lock.
+static bool ms_commit(size_t bytesNeeded)
+{
+    if (g_marksweep.bump + bytesNeeded > g_marksweep.committed)
+    {
+        size_t want = (size_t)(g_marksweep.bump + bytesNeeded - g_marksweep.committed);
+        size_t grain = (want + kCommitGrain - 1) & ~(kCommitGrain - 1);
+        if (g_marksweep.committed + grain > g_marksweep.end)
+        {
+            return false;
+        }
+        if (!GCToOSInterface::VirtualCommit(g_marksweep.committed, grain))
+        {
+            LOG1("VirtualCommit(marksweep %zu) failed", grain);
+            return false;
+        }
+        g_marksweep.committed += grain;
+    }
+    return true;
+}
+
+// Bump-allocate `size` bytes from the high water mark. Caller holds g_marksweep.lock.
+static uint8_t* ms_raw_bump(size_t size)
+{
+    if (!ms_commit(size)) return nullptr;
+    uint8_t* p = g_marksweep.bump;
+    g_marksweep.bump += size;
+    return p;
+}
+
+// ---------------------------------------------------------------------------
+// M1b: STW mark-sweep collection
+// ---------------------------------------------------------------------------
+//
+// Collection sequence:
+//   1. SuspendEE
+//   2. Clear mark bits, prepare gray queue
+//   3. GcScanRoots(callback, max_gen, max_gen, sc) — walks managed stacks,
+//      statics, and runtime-internal roots.
+//   4. Walk our own SimpleHandleStore — every slot is a strong root (we don't
+//      currently distinguish handle types).
+//   5. Drain the gray queue: for each gray object, walk its reference fields
+//      via GCDesc and mark+enqueue any reference that lands in our region.
+//   6. Sweep: linear walk of [start_obj, bump). Any unmarked object becomes
+//      a free slot — fill with g_gc_pFreeObjectMethodTable, push to freelist.
+//      Free objects placed by previous sweeps are passed through as already-free.
+//   7. RestartEE
+//
+// Collection happens under g_marksweep.lock to serialize collectors.
+// Concurrent allocation is not supported (allocator also holds the lock).
+
+namespace
+{
+    // Gray queue: per-collection scratch. Lives in heap-allocated storage so
+    // we don't blow the stack on big graphs.
+    std::vector<uint8_t*> g_grayQueue;
+
+    static inline bool ms_in_region(uint8_t* p)
+    {
+        return p >= g_marksweep.start_obj && p < g_marksweep.bump;
+    }
+
+    static inline size_t ms_bit_index(uint8_t* p)
+    {
+        return (size_t)(p - g_marksweep.start_obj) / kMarkBitGranularity;
+    }
+
+    // Returns true if this is the first time the bit was set (i.e. the caller
+    // should enqueue this object as gray). Returns false if already marked.
+    static bool ms_test_and_set_mark(uint8_t* p)
+    {
+        size_t bit  = ms_bit_index(p);
+        size_t byte = bit >> 3;
+        uint8_t mask = (uint8_t)(1u << (bit & 7));
+        if (g_marksweep.mark_bits[byte] & mask) return false;
+        g_marksweep.mark_bits[byte] |= mask;
+        return true;
+    }
+
+    // Promote callback for GcScanRoots. Marks the referenced object if it
+    // lies in our mark-sweep region.
+    //
+    // For interior pointers (GC_CALL_INTERIOR), we conservatively walk the
+    // region linearly to find the containing object. This is O(N) per
+    // interior root; acceptable given how few such roots exist.
+    static uint8_t* ms_find_containing_object(uint8_t* interior);
+
+    static void LOCALGC_CALLCONV ms_promote_callback(PTR_PTR_Object ppObj,
+                                                     ScanContext* /*sc*/,
+                                                     uint32_t flags)
+    {
+        if (ppObj == nullptr) return;
+        uint8_t* obj = reinterpret_cast<uint8_t*>(*ppObj);
+        if (obj == nullptr || !ms_in_region(obj)) return;
+
+        if (flags & GC_CALL_INTERIOR)
+        {
+            obj = ms_find_containing_object(obj);
+            if (obj == nullptr) return;
+        }
+
+        if (ms_test_and_set_mark(obj))
+        {
+            g_grayQueue.push_back(obj);
+        }
+    }
+
+    // Linear scan to find the object whose [start, start+size) covers `interior`.
+    // Stops if it walks past the high water mark or hits a corrupt header.
+    // Caller must hold g_marksweep.lock (we read free objects' lengths).
+    static uint8_t* ms_find_containing_object(uint8_t* interior)
+    {
+        uint8_t* p   = g_marksweep.start_obj;
+        uint8_t* end = g_marksweep.bump;
+        while (p < end)
+        {
+            MethodTable* mt = *reinterpret_cast<MethodTable**>(p);
+            if (mt == nullptr) return nullptr;
+            uint32_t size;
+            if (mt == g_gc_pFreeObjectMethodTable)
+            {
+                size = (uint32_t)ms_read_free_obj_size(p);
+            }
+            else
+            {
+                size = simplegc_obj_size(mt, p);
+            }
+            if (size < sizeof(void*) || p + size > end) return nullptr;
+            if (interior >= p && interior < p + size) return p;
+            p += size;
+        }
+        return nullptr;
+    }
+
+    // Walk the GC reference fields of `obj` (whose MT is `mt` and total size
+    // is `size`). For each reference into our region, mark+enqueue.
+    //
+    // Ports the go_through_object_cl logic from gc.cpp:7395, restricted to
+    // ContainsGCPointers types and to refs that fall inside our region.
+    static void ms_walk_object_refs(MethodTable* mt, uint8_t* obj, size_t size)
+    {
+        if (!mt->ContainsGCPointers()) return;
+
+        CGCDesc* map = CGCDesc::GetCGCDescFromMT(mt);
+        CGCDescSeries* cur = map->GetHighestSeries();
+        ptrdiff_t cnt = (ptrdiff_t)map->GetNumSeries();
+
+        if (cnt >= 0)
+        {
+            // Plain object (non-array of valuetypes). One series per
+            // contiguous run of reference-typed fields.
+            CGCDescSeries* last = map->GetLowestSeries();
+            do
+            {
+                uint8_t** parm   = reinterpret_cast<uint8_t**>(obj + cur->GetSeriesOffset());
+                uint8_t** ppstop = reinterpret_cast<uint8_t**>(
+                    reinterpret_cast<uint8_t*>(parm) + cur->GetSeriesSize() + size);
+                while (parm < ppstop)
+                {
+                    uint8_t* ref = *parm;
+                    if (ref != nullptr && ms_in_region(ref))
+                    {
+                        if (ms_test_and_set_mark(ref))
+                        {
+                            g_grayQueue.push_back(ref);
+                        }
+                    }
+                    parm++;
+                }
+                cur--;
+            } while (cur >= last);
+        }
+        else
+        {
+            // Repeating series — array of valuetypes that contain refs.
+            // Layout: cnt is negative; cur->val_serie[__i] for __i in [cnt..0)
+            // describes a stride. Walk components from startoffset to obj+size.
+            uint8_t** parm = reinterpret_cast<uint8_t**>(obj + cur->startoffset);
+            ptrdiff_t cs = mt->RawGetComponentSize();
+            uint8_t* obj_end = obj + size;
+            (void)cs; // cs unused — we step by sum of skip+nptrs in the val_serie
+            while (reinterpret_cast<uint8_t*>(parm) < obj_end)
+            {
+                for (ptrdiff_t i = 0; i > cnt; --i)
+                {
+                    HALF_SIZE_T skip  = cur->val_serie[i].skip;
+                    HALF_SIZE_T nptrs = cur->val_serie[i].nptrs;
+                    uint8_t** ppstop = parm + nptrs;
+                    while (parm < ppstop)
+                    {
+                        uint8_t* ref = *parm;
+                        if (ref != nullptr && ms_in_region(ref))
+                        {
+                            if (ms_test_and_set_mark(ref))
+                            {
+                                g_grayQueue.push_back(ref);
+                            }
+                        }
+                        parm++;
+                    }
+                    parm = reinterpret_cast<uint8_t**>(reinterpret_cast<uint8_t*>(parm) + skip);
+                }
+            }
+        }
+    }
+
+    // Walk our SimpleHandleStore as additional roots. Defined later (after
+    // the simplegc_handles namespace is introduced) but declared here.
+    void ms_scan_handle_store();
+
+    // Drain the gray queue: for each marked-but-unscanned object, walk its
+    // reference fields and mark+enqueue every ref that lies in our region.
+    static void ms_drain_gray_queue()
+    {
+        while (!g_grayQueue.empty())
+        {
+            uint8_t* obj = g_grayQueue.back();
+            g_grayQueue.pop_back();
+            MethodTable* mt = *reinterpret_cast<MethodTable**>(obj);
+            if (mt == nullptr || mt == g_gc_pFreeObjectMethodTable) continue;
+            size_t size = simplegc_obj_size(mt, obj);
+            ms_walk_object_refs(mt, obj, size);
+        }
+    }
+
+    // Sweep: linear walk of [start_obj, bump). Unmarked objects become free
+    // slots; we coalesce adjacent dead slots into one free object before
+    // pushing onto the freelist.
+    //
+    // Returns the live byte total (sum of sizes of marked objects, including
+    // the size of pre-existing free objects we passed through unchanged).
+    static uint64_t ms_sweep_locked()
+    {
+        // Reset freelist; we rebuild it from the swept image. Bytes moved into
+        // it are accounted via ms_freelist_push.
+        g_marksweep.free_head = nullptr;
+        g_marksweep.bytes_freelist.store(0, std::memory_order_relaxed);
+
+        uint8_t* p   = g_marksweep.start_obj;
+        uint8_t* end = g_marksweep.bump;
+        uint64_t live_bytes  = 0;
+        uint64_t dead_bytes  = 0;
+        uint64_t swept_count = 0;
+
+        while (p < end)
+        {
+            MethodTable* mt = *reinterpret_cast<MethodTable**>(p);
+            if (mt == nullptr)
+            {
+                // Unallocated tail (shouldn't happen pre-bump). Stop.
+                break;
+            }
+
+            size_t size;
+            bool is_free_filler = (mt == g_gc_pFreeObjectMethodTable);
+            if (is_free_filler)
+            {
+                size = ms_read_free_obj_size(p);
+            }
+            else
+            {
+                size = simplegc_obj_size(mt, p);
+            }
+
+            if (size < sizeof(void*) || p + size > end)
+            {
+                LOG1("sweep: corrupt header at %p (mt=%p size=%zu) — abort", p, mt, size);
+                break;
+            }
+
+            // Coalesce a run of dead/free spans starting at p so the freelist
+            // gets one big slot instead of many small ones.
+            bool start_dead = is_free_filler ||
+                              (g_marksweep.mark_bits[ms_bit_index(p) >> 3] &
+                               (1u << (ms_bit_index(p) & 7))) == 0;
+            if (start_dead)
+            {
+                size_t run = size;
+                if (!is_free_filler)
+                {
+                    swept_count++;
+                    dead_bytes += size;
+                }
+                uint8_t* q = p + size;
+                while (q < end)
+                {
+                    MethodTable* nmt = *reinterpret_cast<MethodTable**>(q);
+                    if (nmt == nullptr) break;
+                    bool n_is_free = (nmt == g_gc_pFreeObjectMethodTable);
+                    size_t nsize = n_is_free ? ms_read_free_obj_size(q)
+                                             : simplegc_obj_size(nmt, q);
+                    if (nsize < sizeof(void*) || q + nsize > end) break;
+                    bool n_marked = !n_is_free &&
+                                    (g_marksweep.mark_bits[ms_bit_index(q) >> 3] &
+                                     (1u << (ms_bit_index(q) & 7))) != 0;
+                    if (n_marked) break;
+                    if (!n_is_free)
+                    {
+                        swept_count++;
+                        dead_bytes += nsize;
+                    }
+                    run += nsize;
+                    q += nsize;
+                }
+                if (run >= ms_free_object_min_size())
+                {
+                    ms_freelist_push(p, run);
+                }
+                p += run;
+            }
+            else
+            {
+                // Live object — leave in place.
+                live_bytes += size;
+                p += size;
+            }
+        }
+
+        g_marksweep.bytes_live_after_collect.store(live_bytes, std::memory_order_relaxed);
+        g_marksweep.bytes_collected_total.fetch_add(dead_bytes, std::memory_order_relaxed);
+        g_marksweep.n_objects_swept.fetch_add(swept_count, std::memory_order_relaxed);
+        g_marksweep.n_collections.fetch_add(1, std::memory_order_relaxed);
+        return live_bytes;
+    }
+} // namespace
+
+
+// ---------------------------------------------------------------------------
 // SimpleHandleStore / SimpleHandleManager
 // ---------------------------------------------------------------------------
 //
@@ -643,6 +1160,31 @@ namespace simplegc_handles
         OBJECTHANDLE h = reinterpret_cast<OBJECTHANDLE>(&b->slots[inIdx]);
         ++g_nextSlot;
         return h;
+    }
+}
+
+// Definition of ms_scan_handle_store (declared above in the unnamed namespace
+// containing the other ms_* helpers). Each non-null slot is treated as a
+// strong reference into our region.
+namespace
+{
+    void ms_scan_handle_store()
+    {
+        std::lock_guard<std::mutex> guard(simplegc_handles::g_handleLock);
+        size_t total = simplegc_handles::g_nextSlot;
+        for (size_t i = 0; i < total; ++i)
+        {
+            size_t bucketIdx = i / simplegc_handles::kBucketSize;
+            size_t inIdx     = i % simplegc_handles::kBucketSize;
+            Object* obj = simplegc_handles::g_buckets[bucketIdx]->slots[inIdx];
+            if (obj == nullptr) continue;
+            uint8_t* p = reinterpret_cast<uint8_t*>(obj);
+            if (!ms_in_region(p)) continue;
+            if (ms_test_and_set_mark(p))
+            {
+                g_grayQueue.push_back(p);
+            }
+        }
     }
 }
 
@@ -735,6 +1277,9 @@ public:
 // it; we expose ourselves as IGCHeap and only set `g_theGCHeap` for internal
 // forwarders that don't apply to this GC.
 
+// Forward declaration so SimpleGCHeap::GarbageCollect can call it.
+HRESULT simplegc_force_collect();
+
 class SimpleGCHeap : public IGCHeapInternal
 {
 public:
@@ -818,9 +1363,10 @@ public:
     HRESULT GarbageCollect(int /*generation*/, bool /*low_memory_p*/, int /*mode*/) override
     {
         TRACE_METHOD();
-        // No-op: we don't actually collect. Just bump the counter.
         g_gcCount.fetch_add(1, std::memory_order_relaxed);
-        return S_OK;
+        // Only the mark-sweep region is collectible. Perm and request are not
+        // touched here — request memory is reclaimed via simplegc_request_end.
+        return simplegc_force_collect();
     }
 
     unsigned GetMaxGeneration()               override { return 2; }
@@ -981,6 +1527,11 @@ public:
         // Phase 4: route refills through the thread's active arena (perm by
         // default; request when inside simplegc_request_begin/end).
         //
+        // M1b: when t_useMarkSweep is set on this thread, route to the
+        // mark-sweep region instead. Mark-sweep allocations are SINGLE-OBJECT
+        // (alloc_ptr == alloc_limit) so the region stays linearly walkable
+        // for sweep. Finalizable / LOH / POH always force perm.
+        //
         // Important: certain allocation classes are conceptually long-lived or
         // require special handling that the request-arena rewind can't honor:
         //   * LOH/POH: large/pinned objects shouldn't bleed into a 64 MB arena
@@ -991,6 +1542,49 @@ public:
         const uint32_t kAlwaysPermFlags =
             GC_ALLOC_FINALIZE | GC_ALLOC_LARGE_OBJECT_HEAP | GC_ALLOC_PINNED_OBJECT_HEAP;
         bool forcePerm = (flags & kAlwaysPermFlags) != 0;
+
+        if (t_useMarkSweep && !forcePerm)
+        {
+            // Mark-sweep allocation: single-object, exact size. Try freelist
+            // first, then bump.
+            size_t alignedSize = (size + 7u) & ~static_cast<size_t>(7);
+            uint8_t* slot = nullptr;
+            {
+                std::lock_guard<std::mutex> guard(g_marksweep.lock);
+                slot = ms_freelist_take(alignedSize);
+                if (slot == nullptr)
+                {
+                    slot = ms_raw_bump(alignedSize);
+                }
+            }
+            if (slot == nullptr)
+            {
+                LOG1("Alloc[marksweep](size=%zu, flags=0x%x) FAILED", size, flags);
+                return nullptr;
+            }
+            g_marksweep.bytes_allocated.fetch_add(alignedSize, std::memory_order_relaxed);
+            g_marksweep.n_objects_allocated.fetch_add(1, std::memory_order_relaxed);
+            g_requestedBytes.fetch_add(size, std::memory_order_relaxed);
+            g_objectCount.fetch_add(1, std::memory_order_relaxed);
+
+            if (acontext != nullptr)
+            {
+                t_lastAllocCtx = acontext;
+                acontext->alloc_ptr   = slot + alignedSize;
+                acontext->alloc_limit = slot + alignedSize;     // disables fast-path bumping
+                acontext->alloc_bytes += (int64_t)alignedSize;
+            }
+
+            // M1a: do NOT track this chunk for post-hoc walk — mark-sweep is
+            // walked exactly during sweep and our M1a counters bin from chunks
+            // that contain back-to-back fast-path allocations, which doesn't
+            // apply here.
+            t_chunkStart = nullptr;
+            t_chunkEnd   = nullptr;
+
+            return reinterpret_cast<Object*>(slot);
+        }
+
         Arena& targetArena = (t_activeArena != nullptr && !forcePerm) ? *t_activeArena : g_perm;
 
         size_t chunkSize = (size > kAllocCtxQuant) ? size : kAllocCtxQuant;
@@ -1140,6 +1734,48 @@ public:
 
 static SimpleGCHeap*       g_simpleHeap    = nullptr;
 static SimpleHandleManager* g_simpleHandleMgr = nullptr;
+
+// ---------------------------------------------------------------------------
+// M1b: STW collection orchestrator (file-scope so simplegc_collect_marksweep
+// can call it).
+// ---------------------------------------------------------------------------
+
+HRESULT simplegc_force_collect()
+{
+    if (g_simpleHeap == nullptr) return S_OK;
+    if (g_marksweep.start_obj == nullptr) return S_OK;
+
+    // Bracket: only one collection at a time.
+    std::lock_guard<std::mutex> guard(g_marksweep.lock);
+
+    // Suspend the EE so we can scan stacks safely. The runtime guarantees
+    // every thread is at a safe point on return.
+    GCToEEInterface::SuspendEE(SUSPEND_FOR_GC);
+
+    // Clear mark bits and gray queue.
+    memset(g_marksweep.mark_bits, 0, g_marksweep.mark_bits_size);
+    g_grayQueue.clear();
+
+    // Collect roots from managed stacks, statics, and runtime-internal sources.
+    ScanContext sc{};
+    sc.promotion = TRUE;
+    sc.concurrent = FALSE;
+    GCToEEInterface::GcScanRoots(&ms_promote_callback, /*condemned*/ 2, /*max_gen*/ 2, &sc);
+
+    // Add our own handle store as roots.
+    ms_scan_handle_store();
+
+    // Trace the live closure.
+    ms_drain_gray_queue();
+
+    // Sweep dead objects into the freelist.
+    uint64_t live = ms_sweep_locked();
+    (void)live;
+
+    GCToEEInterface::RestartEE(/*bFinishedGC*/ true);
+
+    return S_OK;
+}
 
 // ---------------------------------------------------------------------------
 // GC <-> EE entry points
@@ -1453,6 +2089,78 @@ int32_t LOCALGC_CALLCONV
 simplegc_is_mt_tracking_enabled()
 {
     return g_mtTrackingEnabled.load(std::memory_order_acquire);
+}
+
+// ---------------------------------------------------------------------------
+// M1b: mark-sweep region routing and stats
+// ---------------------------------------------------------------------------
+
+// Public ABI struct for mark-sweep region stats. Append-only; static_assert
+// keeps managed-side mirror in sync.
+struct SimpleGCMarkSweepStats
+{
+    uint64_t bytes_allocated;
+    uint64_t bytes_freelist;
+    uint64_t bytes_live_after_collect;
+    uint64_t bytes_collected_total;
+    uint64_t n_collections;
+    uint64_t n_objects_allocated;
+    uint64_t n_objects_swept;
+    uint64_t bytes_committed;
+    uint64_t bytes_bumped;       // bump - start_obj
+    uint64_t bytes_reserved;
+};
+static_assert(sizeof(SimpleGCMarkSweepStats) == 80, "SimpleGCMarkSweepStats ABI");
+
+// Route the calling thread's allocations to the mark-sweep region.
+// Must be paired with simplegc_route_to_marksweep(0) before the thread
+// allocates objects you do NOT want collected (e.g. long-lived state).
+//
+// This flushes any cached alloc context first so the next allocation will
+// fall back into our IGCHeap::Alloc and pick up the new routing.
+GC_EXPORT
+void LOCALGC_CALLCONV
+simplegc_route_to_marksweep(int32_t enable)
+{
+    simplegc_flush_alloc_context(t_lastAllocCtx);
+    t_useMarkSweep = (enable != 0);
+}
+
+GC_EXPORT
+int32_t LOCALGC_CALLCONV
+simplegc_is_routed_to_marksweep()
+{
+    return t_useMarkSweep ? 1 : 0;
+}
+
+GC_EXPORT
+void LOCALGC_CALLCONV
+simplegc_get_marksweep_stats(SimpleGCMarkSweepStats* out)
+{
+    if (out == nullptr) return;
+    out->bytes_allocated          = g_marksweep.bytes_allocated.load(std::memory_order_relaxed);
+    out->bytes_freelist           = g_marksweep.bytes_freelist.load(std::memory_order_relaxed);
+    out->bytes_live_after_collect = g_marksweep.bytes_live_after_collect.load(std::memory_order_relaxed);
+    out->bytes_collected_total    = g_marksweep.bytes_collected_total.load(std::memory_order_relaxed);
+    out->n_collections            = g_marksweep.n_collections.load(std::memory_order_relaxed);
+    out->n_objects_allocated      = g_marksweep.n_objects_allocated.load(std::memory_order_relaxed);
+    out->n_objects_swept          = g_marksweep.n_objects_swept.load(std::memory_order_relaxed);
+    {
+        std::lock_guard<std::mutex> guard(g_marksweep.lock);
+        out->bytes_committed = (uint64_t)(g_marksweep.committed - g_marksweep.start_obj + 64);
+        out->bytes_bumped    = (uint64_t)(g_marksweep.bump - g_marksweep.start_obj);
+    }
+    out->bytes_reserved = (uint64_t)kMarkSweepSize;
+}
+
+// Forward declaration; implementation in the collection section below.
+HRESULT simplegc_force_collect();
+
+GC_EXPORT
+HRESULT LOCALGC_CALLCONV
+simplegc_collect_marksweep()
+{
+    return simplegc_force_collect();
 }
 
 // ---------------------------------------------------------------------------
