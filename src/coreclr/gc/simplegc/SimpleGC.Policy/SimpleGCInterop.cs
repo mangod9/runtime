@@ -83,6 +83,18 @@ public static class SimpleGCInterop
     /// <c>SimpleGCMarkSweepStats</c> struct (80 bytes).</summary>
     [DllImport(Lib, EntryPoint = "simplegc_get_marksweep_stats")]
     public static extern unsafe void GetMarkSweepStats(MarkSweepStats* outBuf);
+
+    /// <summary>Begin a per-request scope. All allocations until
+    /// <see cref="RequestEnd"/> are routed to the request arena and are
+    /// reclaimed in O(1) on scope end. Returns the snapshot bump position
+    /// (informational).</summary>
+    [DllImport(Lib, EntryPoint = "simplegc_request_begin")]
+    public static extern ulong RequestBegin();
+
+    /// <summary>End a per-request scope and rewind the request arena in
+    /// O(1). Returns bytes freed by the rewind.</summary>
+    [DllImport(Lib, EntryPoint = "simplegc_request_end")]
+    public static extern ulong RequestEnd();
 }
 
 /// <summary>Mirror of the native <c>SimpleGCMarkSweepStats</c> ABI struct
