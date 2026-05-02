@@ -1,0 +1,3 @@
+<Project>
+  <!-- Empty - opt out of the dotnet/runtime repo-wide build infra. -->
+</Project>

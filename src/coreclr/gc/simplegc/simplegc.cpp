@@ -121,6 +121,11 @@ namespace
     // walking all alloc contexts.
     thread_local gc_alloc_context* t_lastAllocCtx = nullptr;
 
+    // Forward declaration: defined further down in this namespace once the
+    // M1a per-MT counter machinery is set up. Used by
+    // simplegc_flush_alloc_context.
+    static inline void simplegc_attribute_pending(gc_alloc_context* acontext);
+
     // Flushes the alloc-context cache so the runtime's fast path falls back
     // into our IGCHeap::Alloc on the next allocation.
     //
@@ -142,6 +147,8 @@ namespace
     //              ...
     static inline void simplegc_flush_alloc_context(gc_alloc_context* acontext)
     {
+        // M1a: capture per-MT stats from the chunk we're about to abandon.
+        simplegc_attribute_pending(acontext);
         if (acontext == nullptr) return;
         // Zero combined_limit (the field 8 bytes before acontext).
         uint8_t** combinedLimit = reinterpret_cast<uint8_t**>(
@@ -165,6 +172,241 @@ namespace
 
     constexpr uint32_t kStrategyAbiVersion = 1;
     constexpr uint64_t kConsultThreshold   = 256 * 1024; // 256 KB
+
+    // ---- M1a: per-MethodTable allocation counters --------------------------
+    //
+    // Open-addressed lock-free hash table keyed by MethodTable*. Every chunk
+    // refill (slow-path Alloc) walks the previously-filled chunk and bumps
+    // per-MT (count, bytes, min/max size) for every object it finds.
+    //
+    // Why post-hoc: IGCHeap::Alloc does not receive the MethodTable* — the
+    // runtime writes MT at object[0] AFTER Alloc returns. So we attribute
+    // the previous chunk's contents on the *next* call (or on flush).
+    //
+    // Capacity sized for "all distinct MTs an app touches" — 8192 is
+    // generous for typical .NET apps. Overflow is silently dropped (it's a
+    // stats degradation, never a correctness issue).
+    constexpr size_t kMtTableCapacity = 8192; // must be power of 2
+
+    struct SimpleGCMTEntry
+    {
+        std::atomic<MethodTable*> mt;        // null = empty slot
+        std::atomic<uint64_t>     count;
+        std::atomic<uint64_t>     bytes;
+        std::atomic<uint32_t>     min_size;
+        std::atomic<uint32_t>     max_size;
+    };
+
+    SimpleGCMTEntry        g_mtTable[kMtTableCapacity];
+    std::atomic<uint64_t>  g_mtAttributedObjects{0};
+    std::atomic<uint64_t>  g_mtAttributedBytes{0};
+    std::atomic<uint32_t>  g_mtTableUsed{0};
+    std::atomic<uint64_t>  g_mtOverflowObjects{0}; // table-full drops
+
+    // Default OFF. Managed policy host turns this on via
+    // simplegc_enable_mt_tracking() after the runtime has finished its early
+    // initialization (NativeRuntimeEventSource cctor / reflection setup).
+    // The walk dereferences MethodTable* pointers we read out of the heap,
+    // so it must only run when the runtime is past its bring-up phase.
+    std::atomic<int>       g_mtTrackingEnabled{0};
+
+    // Per-thread tracking of the chunk we last refilled. On next slow-path
+    // entry (or flush) we walk [t_chunkStart, acontext->alloc_ptr) and
+    // attribute objects to their MTs.
+    thread_local uint8_t* t_chunkStart = nullptr;
+    thread_local uint8_t* t_chunkEnd   = nullptr;
+}
+
+// Public ABI struct exposed via simplegc_get_mt_stats. ABI version + size are
+// asserted statically so managed-side mirrors stay in sync. Append-only.
+struct SimpleGCMtStat
+{
+    uint64_t mt_token;     // MethodTable* as opaque uint64
+    uint64_t count;
+    uint64_t bytes;
+    uint32_t min_size;
+    uint32_t max_size;
+};
+static_assert(sizeof(SimpleGCMtStat) == 32, "SimpleGCMtStat ABI mismatch");
+
+namespace
+{
+    // Cheap hash for MT pointer.
+    static inline size_t mt_hash(MethodTable* mt)
+    {
+        uintptr_t h = reinterpret_cast<uintptr_t>(mt);
+        h ^= h >> 16;
+        h *= 0x85ebca6bULL;
+        h ^= h >> 13;
+        return static_cast<size_t>(h) & (kMtTableCapacity - 1);
+    }
+
+    // Lock-free find-or-insert + update.
+    static void mt_record(MethodTable* mt, uint32_t size)
+    {
+        size_t h = mt_hash(mt);
+        for (size_t i = 0; i < kMtTableCapacity; ++i)
+        {
+            size_t idx = (h + i) & (kMtTableCapacity - 1);
+            SimpleGCMTEntry& e = g_mtTable[idx];
+            MethodTable* cur = e.mt.load(std::memory_order_acquire);
+            if (cur == mt)
+            {
+                e.count.fetch_add(1, std::memory_order_relaxed);
+                e.bytes.fetch_add(size, std::memory_order_relaxed);
+                uint32_t mn = e.min_size.load(std::memory_order_relaxed);
+                while (size < mn &&
+                       !e.min_size.compare_exchange_weak(mn, size, std::memory_order_relaxed)) {}
+                uint32_t mx = e.max_size.load(std::memory_order_relaxed);
+                while (size > mx &&
+                       !e.max_size.compare_exchange_weak(mx, size, std::memory_order_relaxed)) {}
+                return;
+            }
+            if (cur == nullptr)
+            {
+                MethodTable* expected = nullptr;
+                if (e.mt.compare_exchange_strong(expected, mt,
+                        std::memory_order_acq_rel, std::memory_order_acquire))
+                {
+                    e.count.store(1, std::memory_order_relaxed);
+                    e.bytes.store(size, std::memory_order_relaxed);
+                    e.min_size.store(size, std::memory_order_relaxed);
+                    e.max_size.store(size, std::memory_order_relaxed);
+                    g_mtTableUsed.fetch_add(1, std::memory_order_relaxed);
+                    return;
+                }
+                // Lost the race; if the winner wrote our MT, just update.
+                if (expected == mt)
+                {
+                    e.count.fetch_add(1, std::memory_order_relaxed);
+                    e.bytes.fetch_add(size, std::memory_order_relaxed);
+                    return;
+                }
+                // Else fall through to next probe.
+            }
+        }
+        // Table full — drop. Bump overflow counter for diagnostics.
+        g_mtOverflowObjects.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    // Compute object size from MT, matching the formula used elsewhere in the
+    // GC. Result is rounded up to 8-byte alignment (matches simplegc_raw_alloc).
+    static inline uint32_t simplegc_obj_size(MethodTable* mt, uint8_t* obj)
+    {
+        uint32_t size = mt->GetBaseSize();
+        if (mt->HasComponentSize())
+        {
+            // Number of components is a uint32_t at object + sizeof(void*).
+            uint32_t numComp = *reinterpret_cast<uint32_t*>(obj + sizeof(void*));
+            size += numComp * mt->RawGetComponentSize();
+        }
+        return (size + 7u) & ~7u;
+    }
+
+    // Sanity-check an MT pointer before dereferencing. We cannot fully
+    // validate without a runtime API, but we can catch obviously-bad values
+    // (low addresses, mis-aligned). Combined with SEH around the deref.
+    static inline bool mt_pointer_plausible(MethodTable* mt)
+    {
+        uintptr_t v = reinterpret_cast<uintptr_t>(mt);
+        if (v < 0x10000) return false;                  // null page / very low
+        if ((v & 0x3) != 0) return false;               // unaligned
+#if defined(_WIN64)
+        // User-mode upper bound on Windows x64 (well above any normal heap).
+        if (v >= 0x800000000000ull) return false;
+#endif
+        return true;
+    }
+
+    // Inner walker: no C++ objects on the stack so we can wrap with SEH.
+    // Returns the number of objects walked; *outBytes accumulates bytes.
+    static uint32_t mt_walk_chunk_inner(uint8_t* p, uint8_t* end, uint64_t* outBytes)
+    {
+        const uint32_t kMaxObjsPerWalk = 65536;
+        uint32_t walkedObjs = 0;
+        uint64_t walkedBytes = 0;
+        while (p < end && walkedObjs < kMaxObjsPerWalk)
+        {
+            MethodTable* mt = *reinterpret_cast<MethodTable**>(p);
+            if (mt == nullptr)
+            {
+                // Object not yet initialized at slow-path entry. Stop here.
+                break;
+            }
+            if (!mt_pointer_plausible(mt))
+            {
+                break;
+            }
+            uint32_t size = simplegc_obj_size(mt, p);
+            if (size < sizeof(void*) || size > 256u * 1024u * 1024u ||
+                p + size > end)
+            {
+                break;
+            }
+            mt_record(mt, size);
+            ++walkedObjs;
+            walkedBytes += size;
+            p += size;
+        }
+        *outBytes = walkedBytes;
+        return walkedObjs;
+    }
+
+    // Walk objects in [chunk_start, end) and attribute each.
+    // Caller guarantees end > chunk_start and end is within the chunk we tracked.
+    static void mt_walk_chunk(uint8_t* chunk_start, uint8_t* end)
+    {
+        uint64_t walkedBytes = 0;
+        uint32_t walkedObjs  = 0;
+#ifdef _WIN32
+        __try
+        {
+            walkedObjs = mt_walk_chunk_inner(chunk_start, end, &walkedBytes);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            // AV during walk — abandon this chunk's attribution. Counters
+            // bumped before the AV stay; we just bail out cleanly.
+            walkedObjs = 0;
+        }
+#else
+        walkedObjs = mt_walk_chunk_inner(chunk_start, end, &walkedBytes);
+#endif
+        if (walkedObjs > 0)
+        {
+            g_mtAttributedObjects.fetch_add(walkedObjs, std::memory_order_relaxed);
+            g_mtAttributedBytes.fetch_add(walkedBytes, std::memory_order_relaxed);
+        }
+    }
+
+    // Drain the per-thread pending chunk into the MT counters. Called on
+    // slow-path entry (before refill) and on flush_alloc_context.
+    static inline void simplegc_attribute_pending(gc_alloc_context* acontext)
+    {
+        if (g_mtTrackingEnabled.load(std::memory_order_acquire) == 0)
+        {
+            t_chunkStart = nullptr;
+            t_chunkEnd   = nullptr;
+            return;
+        }
+
+        if (t_chunkStart == nullptr)
+        {
+            return;
+        }
+        if (acontext != nullptr)
+        {
+            uint8_t* alloc_ptr = acontext->alloc_ptr;
+            // Walk only if alloc_ptr is within the chunk we tracked. After
+            // simplegc_flush_alloc_context zeroed alloc_ptr we'll skip.
+            if (alloc_ptr > t_chunkStart && alloc_ptr <= t_chunkEnd)
+            {
+                mt_walk_chunk(t_chunkStart, alloc_ptr);
+            }
+        }
+        t_chunkStart = nullptr;
+        t_chunkEnd   = nullptr;
+    }
 }
 
 // File-scope (external linkage) so the extern "C" exports below can use these
@@ -675,6 +917,11 @@ public:
     // ---- Allocation ----------------------------------------------------
     Object* Alloc(gc_alloc_context* acontext, size_t size, uint32_t flags) override
     {
+        // ---- M1a: attribute the chunk we're about to abandon ----
+        // The previous chunk (if any) has been bump-filled by fast path; its
+        // objects' MTs are now written. Walk and bin them before we refill.
+        simplegc_attribute_pending(acontext);
+
         // ---- Phase 3 strategy hook: consult BEFORE we reserve any space ----
         //
         // We must do this *before* simplegc_raw_alloc because once we hand
@@ -795,6 +1042,12 @@ public:
             // Note: ee_alloc_context::combined_limit (offset -8 from acontext)
             // is updated by the runtime's slow path after we return, based on
             // alloc_limit. We don't need to touch it here.
+
+            // M1a: remember this chunk so the next slow-path call (or flush)
+            // can walk and attribute it. Includes the new object (which the
+            // runtime will fill MT for after we return).
+            t_chunkStart = chunk;
+            t_chunkEnd   = chunk + chunkSize;
         }
         return obj;
     }
@@ -1112,6 +1365,94 @@ simplegc_get_arena_stats(uint64_t* outPermBytesUsed,
     if (outPermBytesCommitted)    *outPermBytesCommitted    = (uint64_t)(g_perm.committed - g_perm.start);
     if (outRequestBytesUsed)      *outRequestBytesUsed      = (uint64_t)(g_request.bump - g_request.start);
     if (outRequestBytesCommitted) *outRequestBytesCommitted = (uint64_t)(g_request.committed - g_request.start);
+}
+
+// ---------------------------------------------------------------------------
+// M1a: per-MethodTable stats public C ABI
+// ---------------------------------------------------------------------------
+//
+// Managed code calls these via P/Invoke to read the per-MT counter table.
+// MT pointers are returned as opaque uint64 tokens; managed side resolves
+// them to type names via a RuntimeTypeHandle->MT map built at startup.
+
+// Fill `buffer` with up to `capacity` populated entries from the MT table.
+// Returns the number of entries written. The order is implementation-defined
+// (currently table walk order). Empty/zero-count slots are skipped.
+GC_EXPORT
+uint32_t LOCALGC_CALLCONV
+simplegc_get_mt_stats(SimpleGCMtStat* buffer, uint32_t capacity)
+{
+    if (buffer == nullptr || capacity == 0) return 0;
+    uint32_t out = 0;
+    for (size_t i = 0; i < kMtTableCapacity && out < capacity; ++i)
+    {
+        MethodTable* mt = g_mtTable[i].mt.load(std::memory_order_acquire);
+        if (mt == nullptr) continue;
+        uint64_t count = g_mtTable[i].count.load(std::memory_order_relaxed);
+        if (count == 0) continue;
+        buffer[out].mt_token = reinterpret_cast<uint64_t>(mt);
+        buffer[out].count    = count;
+        buffer[out].bytes    = g_mtTable[i].bytes.load(std::memory_order_relaxed);
+        buffer[out].min_size = g_mtTable[i].min_size.load(std::memory_order_relaxed);
+        buffer[out].max_size = g_mtTable[i].max_size.load(std::memory_order_relaxed);
+        ++out;
+    }
+    return out;
+}
+
+// Reset all MT counters to zero. Useful between phases of a benchmark.
+GC_EXPORT
+void LOCALGC_CALLCONV
+simplegc_reset_mt_stats()
+{
+    for (size_t i = 0; i < kMtTableCapacity; ++i)
+    {
+        g_mtTable[i].mt.store(nullptr, std::memory_order_release);
+        g_mtTable[i].count.store(0, std::memory_order_relaxed);
+        g_mtTable[i].bytes.store(0, std::memory_order_relaxed);
+        g_mtTable[i].min_size.store(0, std::memory_order_relaxed);
+        g_mtTable[i].max_size.store(0, std::memory_order_relaxed);
+    }
+    g_mtTableUsed.store(0, std::memory_order_relaxed);
+    g_mtAttributedObjects.store(0, std::memory_order_relaxed);
+    g_mtAttributedBytes.store(0, std::memory_order_relaxed);
+    g_mtOverflowObjects.store(0, std::memory_order_relaxed);
+}
+
+// Aggregate counters: total objects/bytes attributed and overflow drops.
+// Useful to verify the table is keeping up.
+GC_EXPORT
+void LOCALGC_CALLCONV
+simplegc_get_mt_summary(uint64_t* outAttributedObjects,
+                        uint64_t* outAttributedBytes,
+                        uint32_t* outDistinctMts,
+                        uint64_t* outOverflowObjects)
+{
+    if (outAttributedObjects) *outAttributedObjects = g_mtAttributedObjects.load(std::memory_order_relaxed);
+    if (outAttributedBytes)   *outAttributedBytes   = g_mtAttributedBytes.load(std::memory_order_relaxed);
+    if (outDistinctMts)       *outDistinctMts       = g_mtTableUsed.load(std::memory_order_relaxed);
+    if (outOverflowObjects)   *outOverflowObjects   = g_mtOverflowObjects.load(std::memory_order_relaxed);
+}
+
+// Enable or disable per-MT tracking. Default is OFF — managed code must
+// turn it on after CLR startup is complete (the post-hoc walk dereferences
+// MethodTable* pointers we read out of allocation chunks, which is unsafe
+// during very early reflection / EventSource initialization).
+//
+// Calling with `enable != 0` arms the walker. Calling with 0 disables and
+// drops any pending per-thread chunk state on the next slow-path entry.
+GC_EXPORT
+void LOCALGC_CALLCONV
+simplegc_enable_mt_tracking(int32_t enable)
+{
+    g_mtTrackingEnabled.store(enable != 0 ? 1 : 0, std::memory_order_release);
+}
+
+GC_EXPORT
+int32_t LOCALGC_CALLCONV
+simplegc_is_mt_tracking_enabled()
+{
+    return g_mtTrackingEnabled.load(std::memory_order_acquire);
 }
 
 // ---------------------------------------------------------------------------
