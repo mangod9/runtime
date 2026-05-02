@@ -24,6 +24,7 @@
 #include <atomic>
 #include <vector>
 #include <mutex>
+#include <algorithm>
 
 #ifdef _MSC_VER
 #define DLLEXPORT __declspec(dllexport)
@@ -73,6 +74,12 @@ static void simplegc_log(int level, const char* fmt, ...)
 
 // Tag every method with a one-line marker so we can see what the runtime calls.
 #define TRACE_METHOD() LOG2("%s", __FUNCTION__)
+
+// Forward declarations of file-scope helpers needed by code in the anonymous
+// namespace below. The bodies are defined further down (line ~840) once the
+// runtime has wired up g_gc_pFreeObjectMethodTable.
+static inline size_t ms_free_object_min_size();
+static void          ms_set_free_obj(uint8_t* p, size_t size);
 
 // ---------------------------------------------------------------------------
 // Globals required by the standalone GC contract
@@ -222,11 +229,75 @@ namespace
     //              +0: alloc_ptr
     //              +8: alloc_limit
     //              ...
+    // ---- M1e: linearly-walkable arenas --------------------------------------
+    //
+    // To make the perm and request arenas walkable from outside the GC code
+    // (so cross-region references can be discovered during mark), every chunk
+    // we hand out reserves a small `slack` tail past acontext->alloc_limit.
+    // When the alloc context is abandoned (refill, request begin/end, route
+    // change, FixAllocContext for STW), the abandoned region
+    //   [alloc_ptr, alloc_limit + slack)
+    // is overwritten with a g_gc_pFreeObjectMethodTable "free object" header
+    // covering the full tail. The slack guarantees this region is always
+    // >= ms_free_object_min_size() bytes — large enough to encode as a free
+    // object — even when the runtime fast-path leaves a < min-object-size gap
+    // before bailing to slow-path Alloc.
+    static inline size_t arena_fill_slack()
+    {
+        // ms_free_object_min_size() is typically 24 bytes on x64. Round up to
+        // 8-byte alignment with a 32-byte floor so chunk handout math stays
+        // simple even before g_gc_pFreeObjectMethodTable is wired up.
+        size_t s = ms_free_object_min_size();
+        if (s < 32) s = 32;
+        return (s + 7) & ~size_t(7);
+    }
+
+    // Is `p` inside the perm or request bump arena reserved region? Used to
+    // decide whether arena_fill_chunk_tail should write a filler — mark-sweep
+    // single-object "chunks" must NOT have a filler written past alloc_ptr.
+    static inline bool perm_or_request_range(uint8_t* p)
+    {
+        return (p >= g_perm.start && p < g_perm.end)
+            || (p >= g_request.start && p < g_request.end);
+    }
+
+    // Write a g_gc_pFreeObjectMethodTable filler covering the abandoned tail
+    // [alloc_ptr, alloc_limit + slack) of `acontext`'s chunk, IFF that chunk
+    // came from the perm or request bump arena. Caller must invoke BEFORE
+    // zeroing alloc_ptr / alloc_limit.
+    static inline void arena_fill_chunk_tail(gc_alloc_context* acontext)
+    {
+        if (acontext == nullptr) return;
+        uint8_t* alloc_ptr   = acontext->alloc_ptr;
+        uint8_t* alloc_limit = acontext->alloc_limit;
+        if (alloc_ptr == nullptr || alloc_limit == nullptr) return;
+        if (alloc_ptr > alloc_limit) return; // defensive: should never happen
+
+        // Only fill if this chunk is in a bump arena. Mark-sweep single-object
+        // chunks set alloc_ptr == alloc_limit at the END of the slot; writing
+        // a filler past that point would clobber the next MS slot.
+        if (!perm_or_request_range(alloc_ptr))
+        {
+            return;
+        }
+
+        size_t slack    = arena_fill_slack();
+        uint8_t* tail_end = alloc_limit + slack;
+        size_t tail_size  = (size_t)(tail_end - alloc_ptr);
+        // Invariant: every perm/request chunk reserves >= slack bytes past
+        // alloc_limit, so tail_size >= slack >= ms_free_object_min_size().
+        if (tail_size < ms_free_object_min_size()) return;
+        ms_set_free_obj(alloc_ptr, tail_size);
+    }
+
     static inline void simplegc_flush_alloc_context(gc_alloc_context* acontext)
     {
         // M1a: capture per-MT stats from the chunk we're about to abandon.
         simplegc_attribute_pending(acontext);
         if (acontext == nullptr) return;
+        // M1e: encode the abandoned chunk tail as a free object so the arena
+        // remains linearly walkable for cross-region mark.
+        arena_fill_chunk_tail(acontext);
         // Zero combined_limit (the field 8 bytes before acontext).
         uint8_t** combinedLimit = reinterpret_cast<uint8_t**>(
             reinterpret_cast<uint8_t*>(acontext) - sizeof(uint8_t*));
@@ -1155,8 +1226,16 @@ namespace
     // Also bumps per-MT survival counters for the policy engine.
     static void ms_drain_gray_queue()
     {
+        const uint64_t kMaxDrain = 100000000;
+        uint64_t drained = 0;
         while (!g_grayQueue.empty())
         {
+            if (++drained > kMaxDrain)
+            {
+                LOG1("ms_drain_gray_queue: cap reached drained=%llu queue=%zu - ABORTING",
+                     (unsigned long long)drained, g_grayQueue.size());
+                return;
+            }
             uint8_t* obj = g_grayQueue.back();
             g_grayQueue.pop_back();
             MethodTable* mt = *reinterpret_cast<MethodTable**>(obj);
@@ -1165,6 +1244,151 @@ namespace
             mt_record_survived(mt, (uint32_t)size);
             ms_walk_object_refs(mt, obj, size);
         }
+    }
+
+    // M1e: build a sorted vector of MS-region object starts for fast
+    // containment lookup during the conservative pointer scan. Used only
+    // inside force_collect under STW; MS layout is stable while we hold
+    // g_marksweep.lock.
+    //
+    // We only need EXACT-START matches for the conservative scan (perm/
+    // request stack/heap fields holding pointers to MS objects). Interior
+    // pointers from heap fields are vanishingly rare in C# and would only
+    // arise from explicit unsafe code; rooted byrefs on the stack are
+    // already handled via GcScanRoots(GC_CALL_INTERIOR).
+    //
+    // Stored as object starts (not size pairs) — a candidate is "valid" iff
+    // it appears in the vector. A `std::lower_bound` is O(log n). For the
+    // expected MS sizes (thousands of objects), this is comfortably under
+    // a microsecond per probe.
+    static std::vector<uint8_t*> g_msStartsCache;
+
+    static void ms_build_object_start_index()
+    {
+        g_msStartsCache.clear();
+        uint8_t* p   = g_marksweep.start_obj;
+        uint8_t* end = g_marksweep.bump;
+        while (p < end)
+        {
+            MethodTable* mt = *reinterpret_cast<MethodTable**>(p);
+            if (mt == nullptr) break;
+            uint32_t size;
+            if (mt == g_gc_pFreeObjectMethodTable)
+            {
+                size = (uint32_t)ms_read_free_obj_size(p);
+            }
+            else
+            {
+                size = simplegc_obj_size(mt, p);
+                // Real MS objects are recorded; free fillers are skipped
+                // (no point marking a free object).
+                g_msStartsCache.push_back(p);
+            }
+            if (size < sizeof(void*) || p + size > end) break;
+            p += size;
+        }
+        // Already sorted by construction (linear scan from low to high).
+        LOG1("ms_build_object_start_index: %zu MS objects indexed",
+             g_msStartsCache.size());
+    }
+
+    static inline bool ms_is_object_start(uint8_t* candidate)
+    {
+        if (g_msStartsCache.empty()) return false;
+        auto it = std::lower_bound(g_msStartsCache.begin(),
+                                   g_msStartsCache.end(),
+                                   candidate);
+        return it != g_msStartsCache.end() && *it == candidate;
+    }
+
+    // M1e (revised): conservative pointer scan over a bump arena. For every
+    // 8-byte-aligned word in [arena.start + 64, arena.bump), interpret the
+    // word as a pointer and, if it points exactly at an MS object start,
+    // mark+enqueue that object. This closes the cross-region soundness
+    // gap: an MS object whose only root is a perm-arena field
+    // (e.g. a static cache) gets marked before sweep.
+    //
+    // Why conservative scan rather than CGCDesc-based ref walk?
+    //   * The perm arena contains arbitrary runtime-internal types whose
+    //     CGCDesc layouts our naive walker mishandles (the previous
+    //     header-parsing walker crashed mid-arena on a real object).
+    //   * Conservative scan trades a small over-approximation (a non-
+    //     pointer value coincidentally matching an MS object address keeps
+    //     that object alive an extra cycle) for full robustness — no
+    //     header parsing required.
+    //   * Cost is O(arena_size / 8); ~2.5M reads + log-N probes for a
+    //     20 MB arena, well under tens of ms per collection. Card-table
+    //     write barriers can later reduce this to O(dirty_cards).
+    //
+    // Pre-conditions:
+    //   * Caller holds g_marksweep.lock.
+    //   * EE is suspended.
+    //   * ms_build_object_start_index() has been invoked for this collection.
+    //   * MT-parsing of perm objects is intentionally NOT used here.
+    static void ms_walk_arena_for_external_refs(Arena& arena)
+    {
+        constexpr size_t kStartPadding = 64; // matches GC_Initialize layout
+        if (arena.start == nullptr) return;
+        uint8_t* p   = arena.start + kStartPadding;
+        uint8_t* end = arena.bump;
+        // Align p down to 8 bytes (it should already be 8-aligned because
+        // kStartPadding is 64; defensive in case GC_Initialize ever changes).
+        p = reinterpret_cast<uint8_t*>(
+                reinterpret_cast<uintptr_t>(p) & ~uintptr_t(7));
+        if (p >= end) return;
+
+        size_t scanned = 0;
+        size_t marked  = 0;
+        // Quick reject: if no MS objects exist, the scan can't mark anything.
+        if (g_msStartsCache.empty())
+        {
+            LOG1("ms_walk_arena[conservative]: start=%p bump=%p "
+                 "MS index empty - skipping",
+                 arena.start, arena.bump);
+            return;
+        }
+        uint8_t* msLo = g_msStartsCache.front();
+        uint8_t* msHi = g_msStartsCache.back();
+
+        while (p + sizeof(uint8_t*) <= end)
+        {
+            uint8_t* candidate = *reinterpret_cast<uint8_t**>(p);
+            // Cheap range filter avoids most lower_bound calls.
+            if (candidate >= msLo && candidate <= msHi
+                && ms_is_object_start(candidate))
+            {
+                if (ms_test_and_set_mark(candidate))
+                {
+                    g_grayQueue.push_back(candidate);
+                    ++marked;
+                }
+            }
+            ++scanned;
+            p += sizeof(uint8_t*);
+        }
+        LOG1("ms_walk_arena[conservative]: start=%p bump=%p "
+             "scanned=%zu marked=%zu",
+             arena.start, arena.bump, scanned, marked);
+    }
+
+    // Callback for IGCToCLR::GcEnumAllocContexts. Encodes any abandoned chunk
+    // tail as a free object filler and zeros combined_limit / alloc_ptr /
+    // alloc_limit so the runtime's fast path will fall back into our slow-path
+    // Alloc on the next allocation.
+    //
+    // Used during STW collection (simplegc_force_collect) to ensure every
+    // thread's cached chunk is rendered linearly walkable before we walk the
+    // arenas for cross-region references.
+    static void LOCALGC_CALLCONV simplegc_gc_fix_alloc_context_cb(
+        gc_alloc_context* acontext, void*)
+    {
+        if (acontext == nullptr) return;
+        arena_fill_chunk_tail(acontext);
+        uint8_t** combinedLimit = reinterpret_cast<uint8_t**>(
+            reinterpret_cast<uint8_t*>(acontext) - sizeof(uint8_t*));
+        *combinedLimit = nullptr;
+        acontext->alloc_ptr   = nullptr;
+        acontext->alloc_limit = nullptr;
     }
 
     // Sweep: linear walk of [start_obj, bump). Unmarked objects become free
@@ -1580,12 +1804,25 @@ public:
     void     FixAllocContext(gc_alloc_context* acontext, void*, void*) override
     {
         TRACE_METHOD();
-        // Reset the alloc context so subsequent allocations refill from the bump pointer.
-        if (acontext != nullptr)
-        {
-            acontext->alloc_ptr   = nullptr;
-            acontext->alloc_limit = nullptr;
-        }
+        if (acontext == nullptr) return;
+        // M1e: encode the abandoned chunk tail as a free object so the perm/
+        // request arenas remain linearly walkable for the cross-region mark
+        // walk. Must run BEFORE we zero the pointers below. We deliberately
+        // do NOT call simplegc_attribute_pending here — t_chunkStart/t_chunkEnd
+        // are thread-local to whoever last called Alloc(), which is not
+        // necessarily the thread whose context we're being asked to fix.
+        arena_fill_chunk_tail(acontext);
+        // Reset the alloc context so subsequent allocations refill from the bump
+        // pointer (or hit the route-aware slow path). Per the IGCToCLR contract
+        // for GcEnumAllocContexts, the legal modification is setting alloc_ptr
+        // and alloc_limit to zero; we additionally zero combined_limit (the
+        // ee_alloc_context field 8 bytes before the gc_alloc_context) to keep
+        // the runtime's fast path from short-circuiting on a stale value.
+        uint8_t** combinedLimit = reinterpret_cast<uint8_t**>(
+            reinterpret_cast<uint8_t*>(acontext) - sizeof(uint8_t*));
+        *combinedLimit = nullptr;
+        acontext->alloc_ptr   = nullptr;
+        acontext->alloc_limit = nullptr;
     }
     size_t   GetCurrentObjSize() override { return g_totalAllocated.load(); }
     void     SetGCInProgress(bool) override { /* no-op */ }
@@ -1612,6 +1849,14 @@ public:
         // The previous chunk (if any) has been bump-filled by fast path; its
         // objects' MTs are now written. Walk and bin them before we refill.
         simplegc_attribute_pending(acontext);
+
+        // M1e: encode the abandoned chunk tail as a free-object filler so
+        // the perm/request arena remains linearly walkable. Must run AFTER
+        // attribute_pending (which reads alloc_ptr) and BEFORE we hand out
+        // a fresh chunk (which overwrites alloc_ptr/alloc_limit). Skipping
+        // this leaves NULL MT bytes in the arena and breaks the cross-region
+        // mark walk.
+        arena_fill_chunk_tail(acontext);
 
         // ---- Phase 3 strategy hook: consult BEFORE we reserve any space ----
         //
@@ -1772,7 +2017,17 @@ public:
         Arena& targetArena =
             (effRoute == kRouteForceReq && t_activeArena != nullptr) ? *t_activeArena : g_perm;
 
-        size_t chunkSize = (size > kAllocCtxQuant) ? size : kAllocCtxQuant;
+        size_t baseChunkSize = (size > kAllocCtxQuant) ? size : kAllocCtxQuant;
+        // M1e: reserve `slack` bytes at the end of every chunk we hand out.
+        // alloc_limit is positioned `slack` bytes before chunk_end, so when
+        // the alloc context is later abandoned (refill, flush, fix), the
+        // region [alloc_ptr, alloc_limit + slack) is always >= slack bytes
+        // and therefore writable as a single g_gc_pFreeObjectMethodTable
+        // free-object filler. Without this, gaps of < min_free_obj_size bytes
+        // (e.g. 8 or 16) cannot be encoded and the arena loses linear
+        // walkability.
+        size_t slack = arena_fill_slack();
+        size_t chunkSize = baseChunkSize + slack;
         uint8_t* chunk = simplegc_raw_alloc(targetArena, chunkSize);
         if (chunk == nullptr)
         {
@@ -1786,7 +2041,9 @@ public:
         // when GC_ALLOC_ZEROING_OPTIONAL is set on the requesting allocation
         // (the runtime will skip its own zeroing in that case). For the perm
         // arena this is automatic (VirtualAlloc gives zeros and we never
-        // re-allocate), but for the request arena we must zero stale bytes.
+        // re-allocate), but for the request arena we must zero stale bytes —
+        // including the slack tail, which we may overwrite with a free-object
+        // filler later.
         if (&targetArena == &g_request)
         {
             memset(chunk, 0, chunkSize);
@@ -1816,7 +2073,9 @@ public:
         if (acontext != nullptr)
         {
             acontext->alloc_ptr   = chunk + size;
-            acontext->alloc_limit = chunk + chunkSize;
+            // alloc_limit is positioned `slack` bytes BEFORE chunk_end so
+            // arena_fill_chunk_tail can always encode the abandoned tail.
+            acontext->alloc_limit = chunk + baseChunkSize;
             acontext->alloc_bytes += (int64_t)size;
             // Note: ee_alloc_context::combined_limit (offset -8 from acontext)
             // is updated by the runtime's slow path after we return, based on
@@ -1826,7 +2085,7 @@ public:
             // can walk and attribute it. Includes the new object (which the
             // runtime will fill MT for after we return).
             t_chunkStart = chunk;
-            t_chunkEnd   = chunk + chunkSize;
+            t_chunkEnd   = chunk + baseChunkSize;
         }
         return obj;
     }
@@ -1941,6 +2200,20 @@ HRESULT simplegc_force_collect()
         // every thread is at a safe point on return.
         GCToEEInterface::SuspendEE(SUSPEND_FOR_GC);
 
+        // M1e: encode every cached chunk's abandoned tail as a free-object
+        // filler and zero the alloc-context pointers. After this loop, every
+        // byte from start + 64 to bump in g_perm and g_request is either a
+        // real object or a parseable free-object filler — i.e. the arenas
+        // are linearly walkable for the cross-region mark walk below.
+        //
+        // GcEnumAllocContexts iterates ALL threads' alloc contexts, so this
+        // also fixes the multi-threaded case (threads other than the one
+        // that last called Alloc()).
+        LOG1("force_collect: phase=fix-alloc-contexts");
+        GCToEEInterface::GcEnumAllocContexts(&simplegc_gc_fix_alloc_context_cb,
+                                             nullptr);
+        LOG1("force_collect: phase=scan-roots");
+
         // Reset per-collection survival counters on every populated MT entry. The
         // mark phase will re-populate them. Cumulative counters (count, bytes)
         // are NOT reset here.
@@ -1965,9 +2238,30 @@ HRESULT simplegc_force_collect()
 
         // Add our own handle store as roots.
         ms_scan_handle_store();
+        LOG1("force_collect: phase=walk-arenas");
+
+        // M1e: walk the perm and request arenas to discover cross-region
+        // references. Any field of a perm/request object that points into
+        // the mark-sweep region is a root for sweep purposes — without this
+        // walk, MS objects reachable only via long-lived perm state would
+        // be incorrectly swept.
+        //
+        // Implementation: conservative pointer scan. We build a sorted
+        // index of MS object starts (one-shot per collection), then read
+        // every 8-aligned word in the perm/request arenas and treat any
+        // word matching an MS start as a reference. This trades a small
+        // over-approximation (false-positive marks keep dead MS objects
+        // alive an extra cycle) for full robustness — we never parse the
+        // CGCDesc layout of arbitrary perm-arena objects (some of which
+        // are runtime-internal types our parser mishandles).
+        ms_build_object_start_index();
+        ms_walk_arena_for_external_refs(g_perm);
+        ms_walk_arena_for_external_refs(g_request);
+        LOG1("force_collect: phase=drain-gray");
 
         // Trace the live closure (also bumps per-MT survival).
         ms_drain_gray_queue();
+        LOG1("force_collect: phase=sweep");
 
         // Sweep dead objects into the freelist.
         uint64_t live = ms_sweep_locked();
