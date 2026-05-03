@@ -27,6 +27,7 @@ using System.Net.Http;
 using System.Net.Http.Json;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Text.Encodings.Web;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
@@ -156,6 +157,146 @@ internal sealed class SearchResponse
 [JsonSerializable(typeof(ProductSummary[]))]
 [JsonSerializable(typeof(ProductSummary))]
 internal partial class AppJsonContext : JsonSerializerContext { }
+
+// ---------------------------------------------------------------------------
+// M1j: Fortunes domain - TechEmpower-Fortunes-shaped workload.
+// 100 fortune rows live in perm. Each /fortunes request:
+//   - picks 12 deterministic-pseudo-random rows by id
+//   - appends one fixed extra row built per-request
+//   - sorts by Message ASCII
+//   - renders an HTML table with HtmlEncoder-escaped fields
+// Per-request allocation: ~2 KB sorted list + ~3-5 KB rendered HTML +
+// the encoder StringBuilder churn. Closer to TechEmpower Fortunes than
+// /search, and it stresses the same Latin1 / UTF-8 string paths that
+// surfaced the M1i.2 alignment bug.
+// ---------------------------------------------------------------------------
+
+internal sealed class Fortune
+{
+    public int Id { get; set; }
+    public string Message { get; set; } = "";
+}
+
+internal static class Fortunes
+{
+    public static Fortune[] All { get; private set; } = Array.Empty<Fortune>();
+
+    private static readonly string[] s_messages =
+    {
+        "fortune: You will visit a foreign country.",
+        "fortune: A beautiful, smart, and loving person will be coming into your life.",
+        "fortune: Today is a good day to learn something new.",
+        "fortune: A friend is a present you give yourself.",
+        "fortune: An empty stomach is not a good political adviser.",
+        "fortune: <script>alert('xss')</script> would be bad without HtmlEncoder.",
+        "fortune: \"Quoted strings\" & ampersands < > need escaping.",
+        "fortune: Ingen kan tvinges til lykke.",
+        "fortune: 一切都会好起来的。",
+        "fortune: Always look on the bright side of life.",
+        "fortune: A picture is worth a thousand words.",
+        "fortune: Beware the ides of March.",
+        "fortune: Slow and steady wins the race.",
+        "fortune: The early bird catches the worm.",
+        "fortune: Good things come to those who wait.",
+        "fortune: Many hands make light work.",
+        "fortune: A journey of a thousand miles begins with a single step.",
+        "fortune: Actions speak louder than words.",
+        "fortune: Better late than never.",
+        "fortune: Birds of a feather flock together.",
+        "fortune: Don't count your chickens before they hatch.",
+        "fortune: Don't put all your eggs in one basket.",
+        "fortune: Every cloud has a silver lining.",
+        "fortune: Fortune favors the bold.",
+        "fortune: Honesty is the best policy.",
+        "fortune: If it ain't broke, don't fix it.",
+        "fortune: Knowledge is power.",
+        "fortune: Look before you leap.",
+        "fortune: Necessity is the mother of invention.",
+        "fortune: No man is an island.",
+        "fortune: One man's trash is another man's treasure.",
+        "fortune: Practice makes perfect.",
+        "fortune: Rome wasn't built in a day.",
+        "fortune: The pen is mightier than the sword.",
+        "fortune: Time is money.",
+        "fortune: Two heads are better than one.",
+        "fortune: When in Rome, do as the Romans do.",
+        "fortune: Where there's smoke, there's fire.",
+        "fortune: You can't judge a book by its cover.",
+        "fortune: A bad workman blames his tools.",
+        "fortune: A chain is only as strong as its weakest link.",
+        "fortune: A drowning man will clutch at a straw.",
+        "fortune: A fool and his money are soon parted.",
+        "fortune: A leopard cannot change its spots.",
+        "fortune: A miss is as good as a mile.",
+        "fortune: A penny saved is a penny earned.",
+        "fortune: A rolling stone gathers no moss.",
+        "fortune: A stitch in time saves nine.",
+        "fortune: A watched pot never boils.",
+        "fortune: All good things must come to an end.",
+        "fortune: All that glitters is not gold.",
+        "fortune: All's fair in love and war.",
+        "fortune: All's well that ends well.",
+        "fortune: An apple a day keeps the doctor away.",
+        "fortune: Appearances can be deceiving.",
+        "fortune: Beauty is in the eye of the beholder.",
+        "fortune: Beggars can't be choosers.",
+        "fortune: Better safe than sorry.",
+        "fortune: Blood is thicker than water.",
+        "fortune: Charity begins at home.",
+        "fortune: Cleanliness is next to godliness.",
+        "fortune: Curiosity killed the cat.",
+        "fortune: Dead men tell no tales.",
+        "fortune: Discretion is the better part of valor.",
+        "fortune: Don't bite the hand that feeds you.",
+        "fortune: Don't cross the bridge until you come to it.",
+        "fortune: Don't look a gift horse in the mouth.",
+        "fortune: Easy come, easy go.",
+        "fortune: Familiarity breeds contempt.",
+        "fortune: Give credit where credit is due.",
+        "fortune: God helps those who help themselves.",
+        "fortune: Half a loaf is better than none.",
+        "fortune: Haste makes waste.",
+        "fortune: He who hesitates is lost.",
+        "fortune: He who laughs last, laughs longest.",
+        "fortune: Hindsight is twenty-twenty.",
+        "fortune: Hope for the best, prepare for the worst.",
+        "fortune: If at first you don't succeed, try, try again.",
+        "fortune: If you can't beat them, join them.",
+        "fortune: If you give a mouse a cookie, he'll want a glass of milk.",
+        "fortune: It takes two to tango.",
+        "fortune: It's better to give than to receive.",
+        "fortune: It's no use crying over spilt milk.",
+        "fortune: It's the squeaky wheel that gets the grease.",
+        "fortune: Keep your friends close and your enemies closer.",
+        "fortune: Laughter is the best medicine.",
+        "fortune: Let bygones be bygones.",
+        "fortune: Let sleeping dogs lie.",
+        "fortune: Lightning never strikes twice in the same place.",
+        "fortune: Love conquers all.",
+        "fortune: Make hay while the sun shines.",
+        "fortune: Money doesn't grow on trees.",
+        "fortune: No news is good news.",
+        "fortune: Nothing ventured, nothing gained.",
+        "fortune: Old habits die hard.",
+        "fortune: Out of sight, out of mind.",
+        "fortune: People who live in glass houses shouldn't throw stones.",
+        "fortune: Strike while the iron is hot.",
+        "fortune: The grass is always greener on the other side.",
+        "fortune: The proof of the pudding is in the eating.",
+        "fortune: There's no place like home.",
+        "fortune: Variety is the spice of life.",
+    };
+
+    public static void Initialize()
+    {
+        var rows = new Fortune[s_messages.Length];
+        for (int i = 0; i < s_messages.Length; i++)
+        {
+            rows[i] = new Fortune { Id = i + 1, Message = s_messages[i] };
+        }
+        All = rows;
+    }
+}
 
 internal static class Catalog
 {
@@ -335,6 +476,63 @@ internal static class Handler
         }
         return false;
     }
+
+    // M1j Fortunes handler. Picks 12 deterministic-pseudo-random rows by
+    // requestId, appends a per-request fixed extra row, sorts by Message
+    // ASCII, and renders an HTML table with HtmlEncoder-escaped fields.
+    // Returns the rendered HTML body. The Content-Type/Content-Length are
+    // set by the caller.
+    public static string RenderFortunes(int requestId)
+    {
+        var all = Fortunes.All;
+        if (all.Length == 0) return "<html><body>no fortunes</body></html>";
+
+        // Pick 12 rows deterministically from requestId. We want the same
+        // requestId to produce the same selection so tests are reproducible
+        // and so we don't accidentally introduce LCG-state contention across
+        // worker threads.
+        const int picked = 12;
+        var rows = new Fortune[picked + 1];
+        // simple xorshift32 from requestId
+        uint state = (uint)(requestId * 2654435761u);
+        if (state == 0) state = 1;
+        for (int i = 0; i < picked; i++)
+        {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            int idx = (int)(state % (uint)all.Length);
+            rows[i] = all[idx];
+        }
+        // Per-request extra row whose Message changes per request id.
+        rows[picked] = new Fortune
+        {
+            Id = -1,
+            Message = "fortune: Additional fortune added at request time #" + requestId,
+        };
+
+        // Sort by Message ASCII (Ordinal). This is the TechEmpower spec —
+        // the per-request sort is significant allocation pressure for large
+        // catalogs but small here.
+        Array.Sort(rows, static (a, b) => string.CompareOrdinal(a.Message, b.Message));
+
+        // Render. StringBuilder + HtmlEncoder.Default.Encode is what the
+        // canonical Fortunes implementations use. Per-request the SB will
+        // grow ~2-3x, so prime it generously to avoid mid-render resizes.
+        var enc = HtmlEncoder.Default;
+        var sb = new StringBuilder(2048);
+        sb.Append("<!DOCTYPE html><html><head><title>Fortunes</title></head><body><table><tr><th>id</th><th>message</th></tr>");
+        for (int i = 0; i < rows.Length; i++)
+        {
+            sb.Append("<tr><td>");
+            sb.Append(rows[i].Id);
+            sb.Append("</td><td>");
+            sb.Append(enc.Encode(rows[i].Message));
+            sb.Append("</td></tr>");
+        }
+        sb.Append("</table></body></html>");
+        return sb.ToString();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -351,6 +549,7 @@ internal static class Server
         // are referenced from the static field BEFORE the first request and
         // therefore land in perm under simplegc.
         Catalog.Initialize(10_000);
+        Fortunes.Initialize();
 
         var builder = Host.CreateDefaultBuilder()
             .ConfigureLogging(l => l.ClearProviders())   // no log allocations on the hot path
@@ -379,6 +578,25 @@ internal static class Server
                     app.Run(async ctx =>
                     {
                         var path = ctx.Request.Path.Value ?? "";
+
+                        if (path.StartsWith("/fortunes", StringComparison.Ordinal))
+                        {
+                            // Per-request idx via Date-stamp header is too
+                            // expensive; instead use the URL tail if present
+                            // (/fortunes/123 -> 123), else 0. For pure
+                            // /fortunes the workload becomes deterministic
+                            // per warmup but still allocates per-request.
+                            int reqId = 0;
+                            int slash = path.IndexOf('/', 1);
+                            if (slash >= 0 && slash + 1 < path.Length)
+                                int.TryParse(path.AsSpan(slash + 1), out reqId);
+
+                            string html = Handler.RenderFortunes(reqId);
+                            ctx.Response.ContentType = "text/html; charset=utf-8";
+                            await ctx.Response.WriteAsync(html, Encoding.UTF8);
+                            return;
+                        }
+
                         ctx.Response.ContentType = "application/json";
 
                         if (path.StartsWith("/search", StringComparison.Ordinal))
@@ -453,10 +671,11 @@ internal static class Driver
         long[] elapsedTicks = new long[totalRequests];
         long failures = 0;
 
-        // Build a request URL for iteration idx. /items/{idx} or /search?q=...&minPrice=...
+        // Build a request URL for iteration idx. /items/{idx} or /search?q=...&minPrice=... or /fortunes/{idx}
         string Url(int idx)
         {
             if (endpoint == "items") return "/items/" + idx;
+            if (endpoint == "fortunes") return "/fortunes/" + idx;
             // /search: vary q and minPrice deterministically per idx so the
             // same idx always produces the same URL (for reproducibility).
             string q = s_queryTerms[idx % s_queryTerms.Length];
@@ -581,18 +800,143 @@ internal static class Driver
     }
 }
 
+// ---------------------------------------------------------------------------
+// M1j: Memory cap via Windows Job Object. Setting JOB_OBJECT_LIMIT_PROCESS_MEMORY
+// makes the kernel terminate the process if its committed memory exceeds the
+// cap — equivalent to running inside a cgroup memory.max on Linux. We assign
+// the current process to a fresh job before any heavy allocation happens so
+// that Kestrel + warmup are also counted.
+// ---------------------------------------------------------------------------
+
+internal static class MemCap
+{
+    private const uint JOB_OBJECT_LIMIT_PROCESS_MEMORY = 0x00000100;
+    private const int JobObjectExtendedLimitInformation = 9;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct IO_COUNTERS
+    {
+        public ulong ReadOperationCount;
+        public ulong WriteOperationCount;
+        public ulong OtherOperationCount;
+        public ulong ReadTransferCount;
+        public ulong WriteTransferCount;
+        public ulong OtherTransferCount;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct JOBOBJECT_BASIC_LIMIT_INFORMATION
+    {
+        public long PerProcessUserTimeLimit;
+        public long PerJobUserTimeLimit;
+        public uint LimitFlags;
+        public UIntPtr MinimumWorkingSetSize;
+        public UIntPtr MaximumWorkingSetSize;
+        public uint ActiveProcessLimit;
+        public UIntPtr Affinity;
+        public uint PriorityClass;
+        public uint SchedulingClass;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+    {
+        public JOBOBJECT_BASIC_LIMIT_INFORMATION BasicLimitInformation;
+        public IO_COUNTERS IoInfo;
+        public UIntPtr ProcessMemoryLimit;
+        public UIntPtr JobMemoryLimit;
+        public UIntPtr PeakProcessMemoryUsed;
+        public UIntPtr PeakJobMemoryUsed;
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern IntPtr CreateJobObjectW(IntPtr lpJobAttributes, string? lpName);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SetInformationJobObject(
+        IntPtr hJob, int JobObjectInfoClass, IntPtr lpJobObjectInfo, uint cbJobObjectInfoLength);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool AssignProcessToJobObject(IntPtr hJob, IntPtr hProcess);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr GetCurrentProcess();
+
+    public static bool TryApply(int memMb, out string error)
+    {
+        error = "";
+        if (!OperatingSystem.IsWindows())
+        {
+            error = "Job Objects only supported on Windows.";
+            return false;
+        }
+        IntPtr job = CreateJobObjectW(IntPtr.Zero, null);
+        if (job == IntPtr.Zero)
+        {
+            error = $"CreateJobObjectW failed (LastError={Marshal.GetLastWin32Error()})";
+            return false;
+        }
+
+        var info = default(JOBOBJECT_EXTENDED_LIMIT_INFORMATION);
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_PROCESS_MEMORY;
+        info.ProcessMemoryLimit = (UIntPtr)((ulong)memMb * 1024UL * 1024UL);
+
+        int size = Marshal.SizeOf<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>();
+        IntPtr buf = Marshal.AllocHGlobal(size);
+        try
+        {
+            Marshal.StructureToPtr(info, buf, fDeleteOld: false);
+            if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, buf, (uint)size))
+            {
+                error = $"SetInformationJobObject failed (LastError={Marshal.GetLastWin32Error()})";
+                return false;
+            }
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(buf);
+        }
+
+        if (!AssignProcessToJobObject(job, GetCurrentProcess()))
+        {
+            error = $"AssignProcessToJobObject failed (LastError={Marshal.GetLastWin32Error()})";
+            return false;
+        }
+
+        // Intentionally leak the job handle for the lifetime of the process.
+        Console.WriteLine($"MemCap: applied {memMb} MB process memory limit (Job Object).");
+        return true;
+    }
+}
+
 internal static class Program
 {
     private static async Task<int> Main(string[] args)
     {
         int totalRequests = 50_000;
         int concurrency = 8;
-        string endpoint = "search"; // "items" or "search"
+        string endpoint = "search"; // "items", "search", or "fortunes"
+        int memMb = 0; // 0 = no Job Object cap
         for (int i = 0; i < args.Length - 1; i++)
         {
             if (args[i] == "--n") int.TryParse(args[i + 1], out totalRequests);
             if (args[i] == "--c") int.TryParse(args[i + 1], out concurrency);
             if (args[i] == "--ep") endpoint = args[i + 1];
+            if (args[i] == "--mem-mb") int.TryParse(args[i + 1], out memMb);
+        }
+
+        // Apply Job Object memory cap BEFORE starting Kestrel, so Kestrel
+        // and warmup allocations all count against the cap. If the cap is
+        // breached the OS terminates the process — exactly what production
+        // containers do at the cgroup memory limit.
+        if (memMb > 0)
+        {
+            if (!MemCap.TryApply(memMb, out string err))
+            {
+                Console.Error.WriteLine($"WARNING: --mem-mb={memMb} could not be applied: {err}");
+            }
         }
 
         Console.WriteLine("=== SimpleGC kestrel-bench ===");
@@ -601,6 +945,7 @@ internal static class Program
         Console.WriteLine($"  endpoint        : /{endpoint}");
         Console.WriteLine($"  total requests  : {totalRequests:N0}");
         Console.WriteLine($"  concurrency     : {concurrency}");
+        Console.WriteLine($"  mem-mb cap      : {(memMb > 0 ? memMb.ToString() + " MB" : "(unlimited)")}");
         Console.WriteLine($"  url             : {Server.Url}");
 
         using var host = Server.Build();
