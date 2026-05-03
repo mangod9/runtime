@@ -78,8 +78,16 @@ internal static class SimpleGC
         ArenaConfigured = IsLoaded && Environment.GetEnvironmentVariable("SIMPLEGC_USE_ARENA") == "1";
     }
 
-    public static void RequestBegin() { if (ArenaConfigured && s_armed) simplegc_request_begin(); }
-    public static ulong RequestEnd()  => (ArenaConfigured && s_armed) ? simplegc_request_end() : 0UL;
+    public static void RequestBegin()
+    {
+        // SAFETY: see Server.Build() — the per-request bracket is incompatible
+        // with ASP.NET async middleware. Kept as a no-op here so anything
+        // calling it from this binary cannot accidentally re-introduce the
+        // torn-reference race. The native primitive is still exported and
+        // remains safe in single-threaded synchronous contexts (policy-demo).
+    }
+
+    public static ulong RequestEnd() => 0UL;
 
     public static (ulong pu, ulong pc, ulong ru, ulong rc) ArenaStats()
     {
@@ -562,18 +570,27 @@ internal static class Server
                 });
                 web.Configure(app =>
                 {
-                    app.Use(async (ctx, next) =>
-                    {
-                        // Bracket this request. begin/end happen on whichever
-                        // thread the middleware is invoked on. With async, the
-                        // continuation can resume on a different thread - in
-                        // that case the native bracket is incomplete (begin
-                        // ran on thread A, end runs on thread B which has no
-                        // active arena). For sync handlers we are fine.
-                        SimpleGC.RequestBegin();
-                        try { await next(); }
-                        finally { SimpleGC.RequestEnd(); }
-                    });
+                    // NOTE: a per-request RequestBegin/RequestEnd bracket was
+                    // tried here but is fundamentally incompatible with ASP.NET
+                    // async middleware. Two compounding correctness bugs:
+                    //   1. simplegc_request_begin sets a per-thread "active
+                    //      arena" flag. If `await next()` resumes on a
+                    //      different thread, RequestEnd runs there as a no-op
+                    //      (its t_activeArena is null), and the originating
+                    //      thread's flag stays armed forever -- it leaks all
+                    //      future allocations into the request arena.
+                    //   2. Even when end DOES fire on the begin thread, it
+                    //      rewinds the GLOBAL g_request.bump pointer while
+                    //      other in-flight requests still have live objects
+                    //      above the checkpoint. New allocations overwrite
+                    //      them, producing torn references that AV in the
+                    //      Pipelines path (e.g. ChkCastClassSpecial on a
+                    //      ReadOnlySequence<byte>._startObject pointing into
+                    //      reused memory).
+                    // For multi-threaded async servers, the request-arena
+                    // primitive needs either per-request arenas or quiescent-
+                    // point rewind, neither of which exists today. M1j drives
+                    // the win via the policy + NoRefsPerm sub-arena instead.
 
                     app.Run(async ctx =>
                     {
