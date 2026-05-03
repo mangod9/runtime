@@ -92,7 +92,25 @@ internal static class Program
         Workload workload = ParseWorkload(args);
         bool usePolicy   = mode == GcMode.SimplegcPolicy;
         bool useSimplegc = mode != GcMode.Default;
-        Console.WriteLine($"# policy-demo: gc-mode={mode}, workload={workload}");
+        long capMemoryMb = ParseCapMemoryMb(args);
+        int  workloadScale = ParseWorkloadScale(args);
+        if (workloadScale > 1)
+        {
+            s_growLongLivedPerCycle = GrowLongLivedPerCycleDefault * workloadScale;
+        }
+        Console.WriteLine($"# policy-demo: gc-mode={mode}, workload={workload}{(capMemoryMb > 0 ? $", cap-memory-mb={capMemoryMb}" : "")}{(workloadScale > 1 ? $", workload-scale={workloadScale}x" : "")}");
+
+        if (capMemoryMb > 0)
+        {
+            if (!ApplyMemoryCap(capMemoryMb))
+            {
+                Console.Error.WriteLine($"# WARNING: failed to apply memory cap of {capMemoryMb} MB; run continuing without cap.");
+            }
+            else
+            {
+                Console.WriteLine($"# memory cap applied: {capMemoryMb} MB (Job Object JOB_OBJECT_LIMIT_PROCESS_MEMORY)");
+            }
+        }
 
         return workload switch
         {
@@ -102,6 +120,133 @@ internal static class Program
             Workload.Grow    => RunGrowWorkload   (mode, usePolicy, useSimplegc),
             _ => 1,
         };
+    }
+
+    // M1h: parse --workload-scale=N flag (multiplier for grow workload's
+    // long-lived alloc rate; default 1).
+    private static int ParseWorkloadScale(string[] args)
+    {
+        foreach (string a in args)
+        {
+            const string Prefix = "--workload-scale=";
+            if (a.StartsWith(Prefix, StringComparison.Ordinal)
+                && int.TryParse(a.Substring(Prefix.Length), NumberStyles.Integer,
+                                CultureInfo.InvariantCulture, out int n)
+                && n > 0)
+            {
+                return n;
+            }
+        }
+
+        return 1;
+    }
+
+    // M1h: parse --cap-memory-mb=N flag. Negative or missing -> 0 (no cap).
+    private static long ParseCapMemoryMb(string[] args)
+    {
+        foreach (string a in args)
+        {
+            const string Prefix = "--cap-memory-mb=";
+            if (a.StartsWith(Prefix, StringComparison.Ordinal)
+                && long.TryParse(a.Substring(Prefix.Length), NumberStyles.Integer,
+                                 CultureInfo.InvariantCulture, out long mb)
+                && mb > 0)
+            {
+                return mb;
+            }
+        }
+
+        return 0;
+    }
+
+    // M1h: apply a process-level commit cap via Job Object on Windows.
+    // JOB_OBJECT_LIMIT_PROCESS_MEMORY caps the total committed memory the
+    // process can use; exceeding it causes future commits to fail with
+    // OOM. This simulates running the workload inside a memory-constrained
+    // container — the place where GC decisions matter most.
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true, CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+    private static extern IntPtr CreateJobObjectW(IntPtr lpJobAttributes, string? lpName);
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool AssignProcessToJobObject(IntPtr hJob, IntPtr hProcess);
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool SetInformationJobObject(IntPtr hJob, int infoClass, IntPtr lpJobObjectInfo, uint cbJobObjectInfoLength);
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll")]
+    private static extern IntPtr GetCurrentProcess();
+
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    private struct IO_COUNTERS
+    {
+        public ulong ReadOperationCount;
+        public ulong WriteOperationCount;
+        public ulong OtherOperationCount;
+        public ulong ReadTransferCount;
+        public ulong WriteTransferCount;
+        public ulong OtherTransferCount;
+    }
+
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    private struct JOBOBJECT_BASIC_LIMIT_INFORMATION
+    {
+        public long  PerProcessUserTimeLimit;
+        public long  PerJobUserTimeLimit;
+        public uint  LimitFlags;
+        public UIntPtr MinimumWorkingSetSize;
+        public UIntPtr MaximumWorkingSetSize;
+        public uint  ActiveProcessLimit;
+        public UIntPtr Affinity;
+        public uint  PriorityClass;
+        public uint  SchedulingClass;
+    }
+
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    private struct JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+    {
+        public JOBOBJECT_BASIC_LIMIT_INFORMATION BasicLimitInformation;
+        public IO_COUNTERS IoInfo;
+        public UIntPtr ProcessMemoryLimit;
+        public UIntPtr JobMemoryLimit;
+        public UIntPtr PeakProcessMemoryUsed;
+        public UIntPtr PeakJobMemoryUsed;
+    }
+
+    private const uint JOB_OBJECT_LIMIT_PROCESS_MEMORY = 0x100;
+    private const int  JobObjectExtendedLimitInformation = 9;
+
+    private static bool ApplyMemoryCap(long capMb)
+    {
+        if (!OperatingSystem.IsWindows()) return false;
+
+        IntPtr hJob = CreateJobObjectW(IntPtr.Zero, null);
+        if (hJob == IntPtr.Zero) return false;
+
+        var info = new JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+        {
+            BasicLimitInformation = new JOBOBJECT_BASIC_LIMIT_INFORMATION
+            {
+                LimitFlags = JOB_OBJECT_LIMIT_PROCESS_MEMORY,
+            },
+            ProcessMemoryLimit = (UIntPtr)((ulong)capMb * 1024UL * 1024UL),
+        };
+
+        IntPtr buf = System.Runtime.InteropServices.Marshal.AllocHGlobal(System.Runtime.InteropServices.Marshal.SizeOf<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>());
+        try
+        {
+            System.Runtime.InteropServices.Marshal.StructureToPtr(info, buf, fDeleteOld: false);
+            if (!SetInformationJobObject(hJob, JobObjectExtendedLimitInformation, buf,
+                (uint)System.Runtime.InteropServices.Marshal.SizeOf<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>()))
+            {
+                return false;
+            }
+            if (!AssignProcessToJobObject(hJob, GetCurrentProcess())) return false;
+            return true;
+        }
+        finally
+        {
+            System.Runtime.InteropServices.Marshal.FreeHGlobal(buf);
+        }
     }
 
     private static int RunCurrentWorkload(GcMode mode, bool usePolicy, bool useSimplegc)
@@ -785,7 +930,7 @@ internal static class Program
     //
     // Per-cycle pattern:
     //   - Allocate <GrowTransientPerCycle> short-lived TransientItems.
-    //   - Allocate <GrowLongLivedPerCycle> long-lived LongLivedItems and
+    //   - Allocate <s_growLongLivedPerCycle> long-lived LongLivedItems and
     //     store them in roots[]. They survive forever.
     //   - Run a mark-sweep collect (simplegc) or let default GC manage.
     //
@@ -809,8 +954,14 @@ internal static class Program
 
     private const int GrowWarmupCycles      = 5;
     private const int GrowMeasurementCycles = 200;
-    private const int GrowLongLivedPerCycle = 500;
+    private const int GrowLongLivedPerCycleDefault = 500;
     private const int GrowTransientPerCycle = 20_000;
+
+    // M1h: per-run override for long-lived rate. Use --workload-scale=N to
+    // multiply the long-lived alloc count per cycle. N=10 produces ~64 MB
+    // of retained objects (1M × 64 B), enough to push default GC's WSS
+    // beyond simplegc's footprint and let memory caps differentiate them.
+    private static int s_growLongLivedPerCycle = GrowLongLivedPerCycleDefault;
 
     // Static sink to keep TransientItem allocations from being eliminated
     // by JIT escape analysis once the workload loop tiers up.
@@ -818,7 +969,7 @@ internal static class Program
 
     private static int RunGrowWorkload(GcMode mode, bool usePolicy, bool useSimplegc)
     {
-        Console.WriteLine($"# grow workload: cycles={GrowMeasurementCycles}+{GrowWarmupCycles} warmup, longlived/cycle={GrowLongLivedPerCycle}, transient/cycle={GrowTransientPerCycle}");
+        Console.WriteLine($"# grow workload: cycles={GrowMeasurementCycles}+{GrowWarmupCycles} warmup, longlived/cycle={s_growLongLivedPerCycle}, transient/cycle={GrowTransientPerCycle}");
 
         if (useSimplegc)
         {
@@ -826,7 +977,7 @@ internal static class Program
             SimpleGCInterop.EnableMtTracking(1);
         }
 
-        int rootCapacity = GrowLongLivedPerCycle * (GrowWarmupCycles + GrowMeasurementCycles);
+        int rootCapacity = s_growLongLivedPerCycle * (GrowWarmupCycles + GrowMeasurementCycles);
         var roots = new LongLivedItem?[rootCapacity];
         int rootCursor = 0;
 
@@ -866,12 +1017,15 @@ internal static class Program
 
         double tickToUs = 1_000_000.0 / Stopwatch.Frequency;
 
-        // M1g: smart-trigger budget. We mimic default GC's gen0 budget by
-        // only collecting when the mark-sweep arena has accumulated more
+        // M1g/M1h: smart-trigger budget. We mimic default GC's gen0 budget
+        // by only collecting when the mark-sweep arena has accumulated more
         // than this many newly-allocated bytes since the last collect. The
-        // 32 MB threshold is arbitrary but in the same order of magnitude
-        // as a typical gen0 budget on Workstation GC.
-        const long MarkSweepCollectBudgetBytes = 32L * 1024 * 1024;
+        // 8 MB threshold is small enough to give the policy multiple
+        // observation windows on long-running workloads — promotion needs
+        // a type to survive 2 collects, so a smaller budget = earlier
+        // promotion = less data sitting in the MS arena waiting to be
+        // routed elsewhere.
+        const long MarkSweepCollectBudgetBytes = 8L * 1024 * 1024;
         ulong msBytesAtLastCollect = 0;
         if (useSimplegc)
         {
@@ -899,15 +1053,32 @@ internal static class Program
                 Console.WriteLine($"# policy promoted LongLivedItem -> {longLivedRoute} at cycle {cycle}");
             }
 
-            // Transient churn (default route = MS arena for simplegc, gen0
-            // for default GC). The static sink ensures the JIT can't elide
-            // the allocation on tiered-compiled hot paths.
+            // M1h: bump-reset transient arena. Wrap the transient-alloc
+            // phase in a request bracket and force-route those allocations
+            // to the request arena. On RequestEnd the arena rewinds in
+            // O(1), bytes vanish without a sweep — this matches default
+            // GC's gen0 reset semantics. The static sink ensures the JIT
+            // can't elide the allocation on tiered-compiled hot paths.
+            //
+            // We deliberately do NOT bracket LongLivedItem allocations, so
+            // they continue to flow through the policy (which routes them
+            // to NoRefsPerm) and survive the request rewind.
             TransientItem? sink = null;
+            if (useSimplegc)
+            {
+                SimpleGCInterop.RequestBegin();
+                SimpleGCInterop.SetThreadRoute((int)Route.ForceReq);
+            }
             for (int i = 0; i < GrowTransientPerCycle; i++)
             {
                 sink = new TransientItem(i, i + 1, i + 2);
             }
             s_transientSink = sink;
+            if (useSimplegc)
+            {
+                SimpleGCInterop.SetThreadRoute((int)Route.Default);
+                SimpleGCInterop.RequestEnd();
+            }
 
             // Long-lived: bracket with the policy's route hint when present.
             int savedRoute = (int)Route.Default;
@@ -916,7 +1087,7 @@ internal static class Program
                 savedRoute = SimpleGCInterop.GetThreadRoute();
                 SimpleGCInterop.SetThreadRoute((int)longLivedRoute);
             }
-            for (int i = 0; i < GrowLongLivedPerCycle && rootCursor < roots.Length; i++)
+            for (int i = 0; i < s_growLongLivedPerCycle && rootCursor < roots.Length; i++)
             {
                 roots[rootCursor++] = new LongLivedItem(cycle, i, rootCursor);
             }
@@ -1033,7 +1204,7 @@ internal static class Program
         Console.WriteLine($"XGC mode                 = {xgcMode}");
         Console.WriteLine($"XGC workload             = grow");
         Console.WriteLine($"XGC cycles               = {GrowMeasurementCycles} (+{GrowWarmupCycles} warmup)");
-        Console.WriteLine($"XGC longlived_per_cycle  = {GrowLongLivedPerCycle}");
+        Console.WriteLine($"XGC longlived_per_cycle  = {s_growLongLivedPerCycle}");
         Console.WriteLine($"XGC transient_per_cycle  = {GrowTransientPerCycle}");
         Console.WriteLine($"XGC wall_clock_ms        = {wallTotalMs}");
         Console.WriteLine(string.Format(CultureInfo.InvariantCulture,

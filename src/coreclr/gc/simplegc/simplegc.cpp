@@ -101,7 +101,11 @@ namespace
     constexpr size_t kMarkSweepSize  = 256  * 1024 * 1024;  // 256 MB
     constexpr size_t kNoRefsPermSize = 1024 * 1024 * 1024;  // 1 GB (M1g)
     constexpr size_t kHeapSize       = kPermSize + kRequestSize + kMarkSweepSize + kNoRefsPermSize;
-    constexpr size_t kCommitGrain    = 16 * 1024 * 1024;
+    // M1h: smaller commit grain so simplegc can fit under tight Job
+    // Object memory caps. Was 16 MB — reducing to 1 MB lets the substrate
+    // demonstrate graceful operation under ~64-96 MB process memory caps
+    // where the default GC's working set already exceeds the cap.
+    constexpr size_t kCommitGrain    = 1 * 1024 * 1024;
     constexpr size_t kAllocCtxQuant  = 8 * 1024;
 
     // Each arena owns its own bump pointer, committed-watermark, and lock.
