@@ -113,6 +113,23 @@ namespace
     // at the cost of higher per-chunk slack waste. Tune via env at startup.
     size_t            kAllocCtxQuant       = kAllocCtxQuantDefault;
 
+    // M1m: per-thread MS sub-arena ("TLAB of chunks"). Each thread takes a
+    // fresh sub-arena under g_marksweep.lock, then bumps lock-free within it
+    // for chunk-takes. Drastically reduces lock contention under high-c
+    // multi-threaded workloads (Fortunes c=16 was burning ~12s wall on lock
+    // acquires across all threads — sub-arenas amortize that to one
+    // acquire per N chunk-takes where N = subArenaSize/avgChunkSize).
+    //
+    // Cache locality: each thread's allocations stay within a contiguous
+    // sub-arena region, so the thread's working set keeps reusing the same
+    // cache lines instead of scattering across the whole MS region.
+    //
+    // Default 256 KB (32 chunks at 8 KB; mostly fits in modern L2 caches).
+    // SIMPLEGC_SUB_ARENA_KB=0 disables sub-arenas — every chunk-take goes
+    // straight through g_marksweep.lock as before M1m. Useful for A/B test.
+    constexpr size_t kSubArenaSizeDefault = 256 * 1024;
+    size_t           kSubArenaSize        = kSubArenaSizeDefault;
+
     // Each arena owns its own bump pointer, committed-watermark, and lock.
     struct Arena
     {
@@ -392,6 +409,23 @@ namespace
     // whether mutex contention is the throughput bottleneck.
     std::atomic<uint64_t> g_msSlowCalls{0};
     std::atomic<uint64_t> g_msSlowLockUs{0};
+
+    // M1m: per-thread MS sub-arena state. The lock-free fast path bumps
+    // within [t_msSubBump..t_msSubEnd). g_msSubGen is incremented INSIDE
+    // STW (post-sweep, pre-RestartEE) by every collection; threads compare
+    // their cached t_msSubGen against the global gen on every chunk-take
+    // and refill on mismatch (sub-arena memory may have been swept into a
+    // freelist slot, rewound by bump-reset, or both, while STW was active).
+    //
+    // g_msSubArenaTakes counts lock-free fast-path successes; useful as a
+    // ratio against g_msSlowCalls (= lock-acquired path) to measure how
+    // often the fast path wins.
+    thread_local uint8_t* t_msSubBump = nullptr;
+    thread_local uint8_t* t_msSubEnd  = nullptr;
+    thread_local uint64_t t_msSubGen  = 0;
+    std::atomic<uint64_t> g_msSubGen{1};            // start at 1; threads init to 0 (mismatch)
+    std::atomic<uint64_t> g_msSubArenaTakes{0};      // lock-free chunk-takes
+    std::atomic<uint64_t> g_msSubArenaRefills{0};    // fresh sub-arenas allocated under lock
 
     // Single-collection-at-a-time gate. Replaces the `g_marksweep.lock`
     // bracket previously used at the top of simplegc_force_collect.
@@ -966,6 +1000,22 @@ static bool simplegc_init_heap()
                 kAllocCtxQuant = (size_t)(kb * 1024);
                 LOG1("SIMPLEGC_CHUNK_KB=%llu (kAllocCtxQuant=%zu bytes)",
                      (unsigned long long)kb, kAllocCtxQuant);
+            }
+        }
+    }
+    // M1m: SIMPLEGC_SUB_ARENA_KB tunes the per-thread MS sub-arena size.
+    // Default 256 KB. Set to 0 to disable sub-arenas (legacy behavior:
+    // every chunk-take goes through g_marksweep.lock).
+    if (const char* v = std::getenv("SIMPLEGC_SUB_ARENA_KB"))
+    {
+        if (*v != '\0')
+        {
+            uint64_t kb = std::strtoull(v, nullptr, 10);
+            if (kb <= 16384)  // cap at 16 MB
+            {
+                kSubArenaSize = (size_t)(kb * 1024);
+                LOG1("SIMPLEGC_SUB_ARENA_KB=%llu (kSubArenaSize=%zu bytes)",
+                     (unsigned long long)kb, kSubArenaSize);
             }
         }
     }
@@ -2293,41 +2343,162 @@ public:
             // time (arena_fill_chunk_tail), keeping the MS region linearly
             // walkable for ms_build_object_start_index and ms_sweep_locked.
             //
-            // We try the freelist first (recycle freed memory from prior
-            // sweeps — coalesced runs from contiguous dead cohorts make
-            // chunk-sized slots common) and fall back to bump.
+            // M1m: per-thread MS sub-arena fast path. The thread bumps its
+            // own private kSubArenaSize-byte sub-region lock-free for chunks;
+            // it only acquires g_marksweep.lock when refilling the sub-arena.
+            // After every fast-path bump, we maintain a free-object filler at
+            // [t_msSubBump..t_msSubEnd) so the linear walker can pass through
+            // unbumped sub-arena bytes if STW catches us mid-sub-arena.
+            //
+            // Sub-arena invalidation: g_msSubGen is incremented under STW
+            // (post-sweep, pre-RestartEE). Threads compare cached t_msSubGen
+            // against g_msSubGen on every chunk-take and refill on mismatch.
+            // This catches sub-arenas whose memory got swept into a freelist
+            // slot or eaten by bump-reset rewinder during the just-finished
+            // collect.
+            //
+            // Soundness: the lock-free fast path ONLY hands out a chunk if
+            // the post-allocation sub-arena remainder is exactly 0 OR
+            // >= ms_free_object_min_size() — same rule as ms_freelist_take.
+            // Any other remainder would be unfillable slop and would break
+            // the linear walker (which advances by alloc'd object size and
+            // would land in zero-bytes thinking it's a real object).
             size_t alignedSize   = (size + 7u) & ~static_cast<size_t>(7);
             size_t baseChunkSize = (alignedSize > kAllocCtxQuant) ? alignedSize
                                                                   : kAllocCtxQuant;
             size_t slack         = arena_fill_slack();
             size_t chunkSize     = baseChunkSize + slack;
+            const size_t minFreeSize = ms_free_object_min_size();
 
             uint8_t* chunk = nullptr;
+
+            // M1m fast path: lock-free bump within per-thread sub-arena.
+            // The if-condition checks BOTH:
+            //   - sub-arenas are enabled (kSubArenaSize > 0)
+            //   - thread's cached gen matches global (no GC since refill)
+            //   - sub-arena has space for chunkSize bytes
+            //   - post-bump remainder is fillable (0 or >= minFreeSize)
+            if (kSubArenaSize > 0)
+            {
+                uint64_t curGen = g_msSubGen.load(std::memory_order_acquire);
+                if (t_msSubGen == curGen && t_msSubBump != nullptr &&
+                    t_msSubBump + chunkSize <= t_msSubEnd)
+                {
+                    size_t remainder = (size_t)((t_msSubEnd - t_msSubBump) - chunkSize);
+                    if (remainder == 0 || remainder >= minFreeSize)
+                    {
+                        chunk = t_msSubBump;
+                        t_msSubBump += chunkSize;
+                        // Maintain free-object filler at the new sub-arena tail
+                        // so the linear walker can pass through unbumped bytes.
+                        if (remainder >= minFreeSize)
+                        {
+                            ms_set_free_obj(t_msSubBump, remainder);
+                        }
+                        // M1m: zero chunk[0..chunkSize) before handing to runtime.
+                        // The chunk may currently hold a stale free-filler header
+                        // from a prior `ms_set_free_obj(sub, ...)` call (initial
+                        // sub-arena fill OR previous-chunk-take's tail filler that
+                        // landed AT this chunk's start). Runtime allocations with
+                        // GC_ALLOC_ZEROING_OPTIONAL skip their own zeroing and
+                        // expect zero memory. Without this, fields not explicitly
+                        // initialized by the constructor (e.g., reference fields
+                        // defaulted to null) end up holding the filler size bytes
+                        // and AV when dereferenced. ms_freelist_take has the same
+                        // memset; the legacy raw_bump path was safe only because
+                        // ms_raw_bump returned freshly committed (or M1l-rewound,
+                        // explicitly zeroed) memory.
+                        memset(chunk, 0, chunkSize);
+                        g_msSubArenaTakes.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+            }
+
+            // M1k.1 / M1m slow path: under g_marksweep.lock. Either:
+            //   (a) sub-arenas are disabled (kSubArenaSize == 0), or
+            //   (b) the lock-free fast path missed (gen mismatch, sub-arena
+            //       exhausted, or remainder unfillable).
+            // Try to refill the sub-arena, then retry the fast path. If the
+            // chunk is too big for a sub-arena (large allocation), or refill
+            // fails, fall back to direct freelist/raw_bump.
+            if (chunk == nullptr)
             {
                 using ms_clock = std::chrono::steady_clock;
                 auto tLockStart = ms_clock::now();
                 std::lock_guard<std::mutex> guard(g_marksweep.lock);
-                chunk = ms_freelist_take(chunkSize);
+
+                // Try to refill the sub-arena (if enabled and chunk fits).
+                // Note: we may also reach here with a still-valid sub-arena
+                // (e.g., remainder unfillable for THIS chunkSize but room for
+                // smaller). In that case the refill check is false and we
+                // fall through to the direct path.
+                if (kSubArenaSize > 0 && chunkSize <= kSubArenaSize)
+                {
+                    uint64_t curGen = g_msSubGen.load(std::memory_order_relaxed);
+                    bool needRefill = (t_msSubGen != curGen) ||
+                                      (t_msSubBump == nullptr) ||
+                                      (t_msSubBump + chunkSize > t_msSubEnd);
+                    if (needRefill)
+                    {
+                        uint8_t* sub = ms_raw_bump(kSubArenaSize);
+                        if (sub != nullptr)
+                        {
+                            t_msSubBump = sub;
+                            t_msSubEnd  = sub + kSubArenaSize;
+                            t_msSubGen  = curGen;
+                            // Initialize the whole sub-arena as one big filler
+                            // so the linear walker can pass through unbumped
+                            // bytes if STW catches us before any chunk-take.
+                            ms_set_free_obj(sub, kSubArenaSize);
+                            g_msSubArenaRefills.fetch_add(1, std::memory_order_relaxed);
+                        }
+                    }
+
+                    // Try sub-arena bump (now possibly fresh).
+                    if (t_msSubGen == curGen && t_msSubBump != nullptr &&
+                        t_msSubBump + chunkSize <= t_msSubEnd)
+                    {
+                        size_t remainder = (size_t)((t_msSubEnd - t_msSubBump) - chunkSize);
+                        if (remainder == 0 || remainder >= minFreeSize)
+                        {
+                            chunk = t_msSubBump;
+                            t_msSubBump += chunkSize;
+                            if (remainder >= minFreeSize)
+                            {
+                                ms_set_free_obj(t_msSubBump, remainder);
+                            }
+                            // M1m: see fast-path comment above.
+                            memset(chunk, 0, chunkSize);
+                        }
+                    }
+                }
+
+                // Direct fallback (chunk too big for sub-arena, refill failed,
+                // or sub-arenas disabled): freelist + raw_bump.
                 if (chunk == nullptr)
                 {
-                    chunk = ms_raw_bump(chunkSize);
-                }
-                // Fallback: if a chunk-sized slot/bump isn't available, drop
-                // back to per-object size so we can still allocate against the
-                // tail of bump or a small free-list slot. This mirrors the
-                // pre-M1k.1 single-object behavior under pressure.
-                if (chunk == nullptr && alignedSize < kAllocCtxQuant)
-                {
-                    size_t smallChunkSize = alignedSize + slack;
-                    chunk = ms_freelist_take(smallChunkSize);
+                    chunk = ms_freelist_take(chunkSize);
                     if (chunk == nullptr)
                     {
-                        chunk = ms_raw_bump(smallChunkSize);
+                        chunk = ms_raw_bump(chunkSize);
                     }
-                    if (chunk != nullptr)
+                    // Fallback: if a chunk-sized slot/bump isn't available, drop
+                    // back to per-object size so we can still allocate against the
+                    // tail of bump or a small free-list slot. This mirrors the
+                    // pre-M1k.1 single-object behavior under pressure.
+                    if (chunk == nullptr && alignedSize < kAllocCtxQuant)
                     {
-                        baseChunkSize = alignedSize;
-                        chunkSize     = smallChunkSize;
+                        size_t smallChunkSize = alignedSize + slack;
+                        chunk = ms_freelist_take(smallChunkSize);
+                        if (chunk == nullptr)
+                        {
+                            chunk = ms_raw_bump(smallChunkSize);
+                        }
+                        if (chunk != nullptr)
+                        {
+                            baseChunkSize = alignedSize;
+                            chunkSize     = smallChunkSize;
+                        }
                     }
                 }
                 auto tLockEnd = ms_clock::now();
@@ -2755,7 +2926,9 @@ HRESULT simplegc_force_collect()
         uint64_t cumSlowLockUs = g_msSlowLockUs.load(std::memory_order_relaxed);
         uint64_t cumRewound    = g_marksweep.bytes_bump_rewound.load(std::memory_order_relaxed);
         uint64_t bumpAfter     = (uint64_t)(g_marksweep.bump - g_marksweep.start_obj);
-        LOG1("force_collect: phase_us fix=%llu scan=%llu (reset=%llu rtRoots=%llu handles=%llu) walk=%llu drain=%llu sweep=%llu total=%llu  permBytes=%llu requestBytes=%llu  cumSlowCalls=%llu cumSlowLockUs=%llu (avg=%llu ns)  bumpAfter=%llu cumRewound=%llu",
+        uint64_t cumSubTakes   = g_msSubArenaTakes  .load(std::memory_order_relaxed);
+        uint64_t cumSubRefills = g_msSubArenaRefills.load(std::memory_order_relaxed);
+        LOG1("force_collect: phase_us fix=%llu scan=%llu (reset=%llu rtRoots=%llu handles=%llu) walk=%llu drain=%llu sweep=%llu total=%llu  permBytes=%llu requestBytes=%llu  cumSlowCalls=%llu cumSlowLockUs=%llu (avg=%llu ns)  bumpAfter=%llu cumRewound=%llu  subTakes=%llu subRefills=%llu",
              (unsigned long long)fixUs,
              (unsigned long long)scanUs,
              (unsigned long long)scanResetUs,
@@ -2769,7 +2942,16 @@ HRESULT simplegc_force_collect()
              (unsigned long long)cumSlowLockUs,
              (unsigned long long)(cumSlowCalls ? (cumSlowLockUs * 1000ULL / cumSlowCalls) : 0),
              (unsigned long long)bumpAfter,
-             (unsigned long long)cumRewound);
+             (unsigned long long)cumRewound,
+             (unsigned long long)cumSubTakes,
+             (unsigned long long)cumSubRefills);
+
+        // M1m: increment the sub-arena generation counter BEFORE RestartEE
+        // so threads see the new gen on resume. Sub-arena memory may have
+        // been swept into a freelist slot or eaten by bump-reset rewinder
+        // during this collect — invalidating cached sub-arena pointers
+        // forces threads to refill on their next chunk-take.
+        g_msSubGen.fetch_add(1, std::memory_order_release);
 
         GCToEEInterface::RestartEE(/*bFinishedGC*/ true);
     }   // <-- scope-end (was: release g_marksweep.lock here).
