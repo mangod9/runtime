@@ -32,7 +32,14 @@ param(
     # default of 64 MB is a generic value; for tight caps you may want
     # (cap * 0.4) or so to give headroom for non-MS commits (perm, JIT,
     # loaded modules, OS overhead).
-    [int]      $AutoCollectMb = 64
+    [int]      $AutoCollectMb = 64,
+    # M1m: per-thread MS sub-arena size in KB (TLAB of chunks). 256 KB is
+    # the substrate default; lifts the chunk-allocator lock contention
+    # ceiling at loose caps. At tight caps (<=256 MB), 16 threads × 256 KB
+    # of in-flight sub-arenas + Kestrel state can OOM the cap, so the
+    # harness auto-disables sub-arenas (sets to 0) at small caps. Set
+    # explicitly to override.
+    [int]      $SubArenaKb = -1
 )
 
 $ErrorActionPreference = 'Stop'
@@ -100,10 +107,12 @@ function Run-One {
         [long]   $CapMb,
         [int]    $C,
         [int]    $N,
-        [string] $Endpoint
+        [string] $Endpoint,
+        [int]    $SubArenaKbResolved
     )
 
-    $label = "{0,-9} cap={1,5} c={2,3} n={3,6}" -f $Mode, ($CapMb -gt 0 ? "${CapMb}MB" : 'none'), $C, $N
+    $subTag = ($SubArenaKbResolved -gt 0) ? " sub=${SubArenaKbResolved}KB" : ' sub=off'
+    $label = "{0,-9} cap={1,5} c={2,3} n={3,6}{4}" -f $Mode, ($CapMb -gt 0 ? "${CapMb}MB" : 'none'), $C, $N, ($Mode -like 'simplegc*' ? $subTag : '')
     Write-Host -NoNewline "  > $label ... " -ForegroundColor Cyan
 
     # Build env block
@@ -111,6 +120,7 @@ function Run-One {
     if ($Mode -eq 'simplegc') {
         $envBlock['DOTNET_GCName']           = 'simplegc.dll'
         $envBlock['DOTNET_StandaloneGCName'] = 'simplegc.dll'
+        $envBlock['SIMPLEGC_SUB_ARENA_KB']   = "$SubArenaKbResolved"
         # NOTE: SIMPLEGC_USE_ARENA bracket retired (see Server.Build) —
         # set it for parity with M1j.2 reproducer but it is now a no-op
         # in the kestrel-bench binary.
@@ -127,6 +137,7 @@ function Run-One {
         $envBlock['DOTNET_StandaloneGCName'] = 'simplegc.dll'
         $envBlock['SIMPLEGC_DEFAULT_ROUTE']  = 'marksweep'
         $envBlock['SIMPLEGC_AUTO_COLLECT_MB'] = "$AutoCollectMb"
+        $envBlock['SIMPLEGC_SUB_ARENA_KB']   = "$SubArenaKbResolved"
     }
     # else 'default': leave env empty so runtime uses regular GC.
 
@@ -135,7 +146,8 @@ function Run-One {
 
     # Apply env, run, capture, restore. Snapshot prior values for restore.
     $envKeys = @('DOTNET_GCName','DOTNET_StandaloneGCName',
-                 'SIMPLEGC_DEFAULT_ROUTE','SIMPLEGC_AUTO_COLLECT_MB')
+                 'SIMPLEGC_DEFAULT_ROUTE','SIMPLEGC_AUTO_COLLECT_MB',
+                 'SIMPLEGC_SUB_ARENA_KB')
     $prior = @{}
     foreach ($k in $envKeys) {
         $prior[$k] = [Environment]::GetEnvironmentVariable($k)
@@ -226,7 +238,22 @@ foreach ($mode in $Modes) {
         continue
     }
     foreach ($cap in $CapsMb) {
-        $row = Run-One -Mode $mode -CapMb $cap -C $C -N $N -Endpoint $Endpoint
+        # Resolve sub-arena size for this cap.
+        # If user explicitly set -SubArenaKb, use that. Else auto-tune:
+        #   cap >  256 MB OR uncapped : use 256 KB (M1m default; lock contention removed)
+        #   cap <= 256 MB              : disable (0)  — M1m's per-thread sub-arenas
+        #                                              over-commit MS at tight caps,
+        #                                              regressing the M1k.1 survival
+        #                                              zone. SUB_ARENA=0 falls back to
+        #                                              M1k.1 chunked-with-lock behavior.
+        if ($SubArenaKb -ge 0) {
+            $resolvedSubArenaKb = $SubArenaKb
+        } elseif ($cap -gt 0 -and $cap -le 256) {
+            $resolvedSubArenaKb = 0
+        } else {
+            $resolvedSubArenaKb = 256
+        }
+        $row = Run-One -Mode $mode -CapMb $cap -C $C -N $N -Endpoint $Endpoint -SubArenaKbResolved $resolvedSubArenaKb
         [void]$results.Add($row)
     }
 }
