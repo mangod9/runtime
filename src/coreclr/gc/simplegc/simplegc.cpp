@@ -265,14 +265,22 @@ namespace
         return (s + 7) & ~size_t(7);
     }
 
-    // Is `p` inside the perm or request bump arena reserved region? Used to
-    // decide whether arena_fill_chunk_tail should write a filler — mark-sweep
-    // single-object "chunks" must NOT have a filler written past alloc_ptr.
-    static inline bool perm_or_request_range(uint8_t* p)
+    // Is `p` inside a bump-arena chunk (perm / request / norefsPerm / MS)?
+    // Used to decide whether arena_fill_chunk_tail should write a filler.
+    //
+    // M1k.1: MS chunks now follow the same slack convention as perm/request —
+    // every MS chunk reserves `slack` bytes past acontext->alloc_limit so the
+    // tail can always be encoded as a free-object filler at fix-alloc-context
+    // time. This keeps the MS region linearly walkable for sweep and for the
+    // ms_build_object_start_index walker, which is required because MS uses
+    // chunk-based allocation (multiple back-to-back JIT-fast-path objects per
+    // slow-path call) instead of single-object slots.
+    static inline bool bumpable_arena_range(uint8_t* p)
     {
-        return (p >= g_perm.start && p < g_perm.end)
-            || (p >= g_request.start && p < g_request.end)
-            || (p >= g_norefsPerm.start && p < g_norefsPerm.end);
+        return (p >= g_perm.start       && p < g_perm.end)
+            || (p >= g_request.start    && p < g_request.end)
+            || (p >= g_norefsPerm.start && p < g_norefsPerm.end)
+            || (p >= g_marksweep.start_obj && p < g_marksweep.end);
     }
 
     // Write a g_gc_pFreeObjectMethodTable filler covering the abandoned tail
@@ -287,10 +295,11 @@ namespace
         if (alloc_ptr == nullptr || alloc_limit == nullptr) return;
         if (alloc_ptr > alloc_limit) return; // defensive: should never happen
 
-        // Only fill if this chunk is in a bump arena. Mark-sweep single-object
-        // chunks set alloc_ptr == alloc_limit at the END of the slot; writing
-        // a filler past that point would clobber the next MS slot.
-        if (!perm_or_request_range(alloc_ptr))
+        // Only fill if this chunk is in a bump arena (perm / request /
+        // norefsPerm / MS). Each of these arenas reserves `slack` bytes past
+        // alloc_limit when handing out a chunk, so writing the filler stays
+        // inside the chunk we own.
+        if (!bumpable_arena_range(alloc_ptr))
         {
             return;
         }
@@ -2101,9 +2110,19 @@ public:
                 static_cast<uint64_t>(g_marksweep.committed - g_marksweep.start_obj);
             if (msCommitted >= threshold)
             {
+                // Throttle: don't re-fire until bytes_allocated has grown by
+                // at least the user-configured threshold since the last auto
+                // fire. Scales naturally with AutoCollectMb, so users who pick
+                // a larger threshold also get less aggressive throttling. With
+                // chunk-based MS allocation each slow path bumps bytes_allocated
+                // by 8 KB, so anchoring throttle to a fixed 16 MB constant fires
+                // far too often under continuous-churn workloads (e.g. Fortunes).
                 uint64_t total    = g_marksweep.bytes_allocated.load(std::memory_order_relaxed);
                 uint64_t lastAuto = g_bytesAtLastAutoCollect.load(std::memory_order_relaxed);
-                if (total >= lastAuto + kAutoCollectThrottleBytes &&
+                uint64_t throttle = threshold > kAutoCollectThrottleBytes
+                                        ? threshold
+                                        : kAutoCollectThrottleBytes;
+                if (total >= lastAuto + throttle &&
                     g_bytesAtLastAutoCollect.compare_exchange_strong(lastAuto, total))
                 {
                     s_inConsult = true;
@@ -2178,24 +2197,80 @@ public:
 
         if (effRoute == kRouteMarkSweep)
         {
-            // Mark-sweep allocation: single-object, exact size. Try freelist
-            // first, then bump.
-            size_t alignedSize = (size + 7u) & ~static_cast<size_t>(7);
-            uint8_t* slot = nullptr;
+            // M1k.1: chunk-based MS allocation (TLAB-style).
+            //
+            // Earlier (single-object) MS path acquired g_marksweep.lock on
+            // every allocation and disabled the JIT fast path by setting
+            // alloc_ptr == alloc_limit. Under c=16+ HTTP concurrency, all
+            // threads serialized on the mutex on every allocation — capping
+            // throughput at ~10k rps even on workloads where the default
+            // GC ran at 37k+ rps.
+            //
+            // Now: take a chunk of max(size, kAllocCtxQuant) + slack bytes
+            // and hand it to the alloc context. JIT fast path bumps within
+            // the chunk lock-free until it exhausts. Slack tail at chunk
+            // end gets encoded as a free filler at GC fix-alloc-context
+            // time (arena_fill_chunk_tail), keeping the MS region linearly
+            // walkable for ms_build_object_start_index and ms_sweep_locked.
+            //
+            // We try the freelist first (recycle freed memory from prior
+            // sweeps — coalesced runs from contiguous dead cohorts make
+            // chunk-sized slots common) and fall back to bump.
+            size_t alignedSize   = (size + 7u) & ~static_cast<size_t>(7);
+            size_t baseChunkSize = (alignedSize > kAllocCtxQuant) ? alignedSize
+                                                                  : kAllocCtxQuant;
+            size_t slack         = arena_fill_slack();
+            size_t chunkSize     = baseChunkSize + slack;
+
+            uint8_t* chunk = nullptr;
             {
                 std::lock_guard<std::mutex> guard(g_marksweep.lock);
-                slot = ms_freelist_take(alignedSize);
-                if (slot == nullptr)
+                chunk = ms_freelist_take(chunkSize);
+                if (chunk == nullptr)
                 {
-                    slot = ms_raw_bump(alignedSize);
+                    chunk = ms_raw_bump(chunkSize);
+                }
+                // Fallback: if a chunk-sized slot/bump isn't available, drop
+                // back to per-object size so we can still allocate against the
+                // tail of bump or a small free-list slot. This mirrors the
+                // pre-M1k.1 single-object behavior under pressure.
+                if (chunk == nullptr && alignedSize < kAllocCtxQuant)
+                {
+                    size_t smallChunkSize = alignedSize + slack;
+                    chunk = ms_freelist_take(smallChunkSize);
+                    if (chunk == nullptr)
+                    {
+                        chunk = ms_raw_bump(smallChunkSize);
+                    }
+                    if (chunk != nullptr)
+                    {
+                        baseChunkSize = alignedSize;
+                        chunkSize     = smallChunkSize;
+                    }
                 }
             }
-            if (slot == nullptr)
+            if (chunk == nullptr)
             {
                 LOG1("Alloc[marksweep](size=%zu, flags=0x%x) FAILED", size, flags);
                 return nullptr;
             }
-            g_marksweep.bytes_allocated.fetch_add(alignedSize, std::memory_order_relaxed);
+
+            // bytes_allocated drives the auto-collect throttle (16 MB delta
+            // between collects) and the policy-demo smart-trigger. Track
+            // baseChunkSize per chunk-take regardless of source (bump or
+            // freelist) — this represents the in-use portion of the chunk
+            // that the runtime will fill with user data via JIT fast path.
+            // Both bump and freelist sources represent real "work to do"
+            // pressure that the throttle should observe. Excluding `slack`
+            // is correct: slack is the free-filler tail.
+            //
+            // Without this attribution being chunk-sized, the throttle would
+            // either:
+            //   - undercount (alignedSize) → policy-demo's smart-trigger
+            //     would barely fire; auto-promotion never kicks in.
+            //   - count only fromBump → after bump fills (tight caps), the
+            //     throttle stops, freelist drains without compaction, OOM.
+            g_marksweep.bytes_allocated.fetch_add(baseChunkSize, std::memory_order_relaxed);
             g_marksweep.n_objects_allocated.fetch_add(1, std::memory_order_relaxed);
             g_requestedBytes.fetch_add(size, std::memory_order_relaxed);
             g_objectCount.fetch_add(1, std::memory_order_relaxed);
@@ -2203,19 +2278,23 @@ public:
             if (acontext != nullptr)
             {
                 t_lastAllocCtx = acontext;
-                acontext->alloc_ptr   = slot + alignedSize;
-                acontext->alloc_limit = slot + alignedSize;     // disables fast-path bumping
+                acontext->alloc_ptr   = chunk + size;
+                // Slack-aware: alloc_limit is positioned `slack` bytes BEFORE
+                // chunk_end so arena_fill_chunk_tail can always encode the
+                // abandoned tail as a g_gc_pFreeObjectMethodTable filler.
+                acontext->alloc_limit = chunk + baseChunkSize;
                 acontext->alloc_bytes += (int64_t)alignedSize;
+
+                // Track this chunk for post-hoc per-MT attribution. The next
+                // slow-path call (or flush) walks [t_chunkStart, alloc_ptr)
+                // and increments per-MT alloc counters via mt_walk_chunk.
+                // With JIT fast-path bumping the chunk, this captures every
+                // object the runtime allocated since chunk-take.
+                t_chunkStart = chunk;
+                t_chunkEnd   = chunk + baseChunkSize;
             }
 
-            // M1a: do NOT track this chunk for post-hoc walk — mark-sweep is
-            // walked exactly during sweep and our M1a counters bin from chunks
-            // that contain back-to-back fast-path allocations, which doesn't
-            // apply here.
-            t_chunkStart = nullptr;
-            t_chunkEnd   = nullptr;
-
-            return reinterpret_cast<Object*>(slot);
+            return reinterpret_cast<Object*>(chunk);
         }
 
         // Bump-pointer (perm / norefsPerm / request) path. Force-route
