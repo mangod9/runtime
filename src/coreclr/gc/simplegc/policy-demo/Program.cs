@@ -833,11 +833,18 @@ internal static class Program
         PolicyHost? host = null;
         if (useSimplegc)
         {
+            // M1g: route to NoRefsPerm. The substrate enforces ref-freeness
+            // (silently re-routes to ForcePerm if the runtime says
+            // GC_ALLOC_CONTAINS_REF is set), so this is safe even for
+            // ref-bearing types — they simply pay the same cost as before.
+            // Ref-free types (like LongLivedItem) land in g_norefsPerm and
+            // are skipped by the conservative cross-region scan, eliminating
+            // the per-collect O(perm_size) sweep cost.
             IPolicy policy = usePolicy
-                ? new BasicPolicy { PromoteTo = Route.ForcePerm }
+                ? new BasicPolicy { PromoteTo = Route.NoRefsPerm }
                 : new PassivePolicy();
             host = PolicyHost.Start(policy);
-            Console.WriteLine($"# grow workload: {policy.GetType().Name} started");
+            Console.WriteLine($"# grow workload: {policy.GetType().Name} started (promote-to={Route.NoRefsPerm})");
         }
 
         // ---- Cross-GC metric setup ----
@@ -854,8 +861,27 @@ internal static class Program
         long firstMeasureCollectUs     = -1;
         long lastMeasureCollectUs      = -1;
         int  promotionCycle            = -1;  // when did policy promote LongLivedItem?
+        int  collectsTriggered         = 0;
+        ulong norefsPermBytesPeak      = 0;
 
         double tickToUs = 1_000_000.0 / Stopwatch.Frequency;
+
+        // M1g: smart-trigger budget. We mimic default GC's gen0 budget by
+        // only collecting when the mark-sweep arena has accumulated more
+        // than this many newly-allocated bytes since the last collect. The
+        // 32 MB threshold is arbitrary but in the same order of magnitude
+        // as a typical gen0 budget on Workstation GC.
+        const long MarkSweepCollectBudgetBytes = 32L * 1024 * 1024;
+        ulong msBytesAtLastCollect = 0;
+        if (useSimplegc)
+        {
+            unsafe
+            {
+                MarkSweepStats ms;
+                SimpleGCInterop.GetMarkSweepStats(&ms);
+                msBytesAtLastCollect = ms.BytesAllocated;
+            }
+        }
 
         Console.WriteLine("phase,cycle,collect_us,managed_kb,wss_kb,longlived_route");
 
@@ -899,25 +925,56 @@ internal static class Program
                 SimpleGCInterop.SetThreadRoute(savedRoute);
             }
 
-            // Per-cycle collect (simplegc only — default GC manages itself).
+            // M1g: smart-trigger collect. Only fire a mark-sweep collect when
+            // the MS arena has accumulated more than the budget since the
+            // last collect. This mirrors how default GC defers gen0 until
+            // the gen0 budget is exhausted, instead of collecting every
+            // cycle. For workloads where the policy has successfully
+            // promoted long-lived types out of MS, this dramatically
+            // reduces collect count.
             long collectUs = 0;
             if (useSimplegc)
             {
-                long collectStart = Stopwatch.GetTimestamp();
-                int rc = SimpleGCInterop.CollectMarkSweep();
-                long collectEnd = Stopwatch.GetTimestamp();
-                collectUs = (long)((collectEnd - collectStart) * tickToUs);
-                if (rc < 0)
+                bool shouldCollect;
+                unsafe
                 {
-                    Console.Error.WriteLine($"# CollectMarkSweep failed: {rc}");
-                    return 2;
+                    MarkSweepStats ms;
+                    SimpleGCInterop.GetMarkSweepStats(&ms);
+                    ulong newBytes = ms.BytesAllocated >= msBytesAtLastCollect
+                                     ? ms.BytesAllocated - msBytesAtLastCollect
+                                     : 0;
+                    shouldCollect = (long)newBytes >= MarkSweepCollectBudgetBytes
+                                 || cycle == totalCycles - 1;
                 }
-                if (!warmup)
+                if (shouldCollect)
                 {
-                    crossSimplegcCollectUsSum += collectUs;
-                    if (firstMeasureCollectUs < 0) firstMeasureCollectUs = collectUs;
-                    lastMeasureCollectUs = collectUs;
+                    long collectStart = Stopwatch.GetTimestamp();
+                    int rc = SimpleGCInterop.CollectMarkSweep();
+                    long collectEnd = Stopwatch.GetTimestamp();
+                    collectUs = (long)((collectEnd - collectStart) * tickToUs);
+                    if (rc < 0)
+                    {
+                        Console.Error.WriteLine($"# CollectMarkSweep failed: {rc}");
+                        return 2;
+                    }
+                    ++collectsTriggered;
+                    unsafe
+                    {
+                        MarkSweepStats ms;
+                        SimpleGCInterop.GetMarkSweepStats(&ms);
+                        msBytesAtLastCollect = ms.BytesAllocated;
+                    }
+                    if (!warmup)
+                    {
+                        crossSimplegcCollectUsSum += collectUs;
+                        if (firstMeasureCollectUs < 0) firstMeasureCollectUs = collectUs;
+                        lastMeasureCollectUs = collectUs;
+                    }
                 }
+
+                // Track norefsPerm peak for the summary.
+                SimpleGCInterop.GetNoRefsPermStats(out ulong nrpUsed, out _);
+                if (nrpUsed > norefsPermBytesPeak) norefsPermBytesPeak = nrpUsed;
             }
 
             // Sample WSS / managed every 20 cycles.
@@ -972,7 +1029,7 @@ internal static class Program
         }
 
         Console.WriteLine();
-        Console.WriteLine("# === Cross-GC summary (M1f-d grow workload) ===");
+        Console.WriteLine("# === Cross-GC summary (M1g grow workload) ===");
         Console.WriteLine($"XGC mode                 = {xgcMode}");
         Console.WriteLine($"XGC workload             = grow");
         Console.WriteLine($"XGC cycles               = {GrowMeasurementCycles} (+{GrowWarmupCycles} warmup)");
@@ -991,9 +1048,13 @@ internal static class Program
         Console.WriteLine($"XGC pause_total_ms       = {pauseTotalMs}    # source: {pauseSource}");
         if (useSimplegc)
         {
+            Console.WriteLine($"XGC simplegc_collects    = {collectsTriggered} (smart-trigger budget = {MarkSweepCollectBudgetBytes >> 20} MB)");
             Console.WriteLine($"XGC first_collect_us     = {firstMeasureCollectUs}");
             Console.WriteLine($"XGC last_collect_us      = {lastMeasureCollectUs}");
             Console.WriteLine($"XGC promotion_cycle      = {promotionCycle}    # -1 means policy never promoted");
+            Console.WriteLine(string.Format(CultureInfo.InvariantCulture,
+                "XGC norefsperm_peak_mb   = {0:F3}    # bytes routed to ref-free perm sub-arena (skipped by conservative scan)",
+                norefsPermBytesPeak / 1024.0 / 1024.0));
         }
         Console.WriteLine($"XGC retained             = {retained}/{rootCapacity}");
 

@@ -15,12 +15,21 @@ namespace SimpleGC.Policy;
 ///     scoped objects.</description></item>
 ///   <item><description><see cref="MarkSweep"/> — free-list-backed mark-sweep region.
 ///     Best for objects with a mix of long lifetimes and reclaimable churn.</description></item>
+///   <item><description><see cref="NoRefsPerm"/> — bump-allocate in a no-references
+///     perm sub-arena. The substrate enforces ref-freeness at allocation
+///     time using <c>GC_ALLOC_CONTAINS_REF</c>; allocations that contain
+///     refs are silently re-routed to <see cref="ForcePerm"/>. Because the
+///     arena is provably ref-free, the conservative cross-region pointer
+///     scan skips it entirely — making this the right route for ref-free
+///     long-lived types (caches of primitives, interned values, etc.).
+///     </description></item>
 /// </list>
 /// </summary>
 public enum Route : byte
 {
-    Default   = 0,
-    ForcePerm = 1,
-    ForceReq  = 2,
-    MarkSweep = 3,
+    Default    = 0,
+    ForcePerm  = 1,
+    ForceReq   = 2,
+    MarkSweep  = 3,
+    NoRefsPerm = 4,
 }

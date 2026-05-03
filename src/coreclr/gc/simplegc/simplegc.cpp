@@ -99,7 +99,8 @@ namespace
     constexpr size_t kPermSize       = 1024 * 1024 * 1024;  // 1 GB
     constexpr size_t kRequestSize    = 256  * 1024 * 1024;  // 256 MB
     constexpr size_t kMarkSweepSize  = 256  * 1024 * 1024;  // 256 MB
-    constexpr size_t kHeapSize       = kPermSize + kRequestSize + kMarkSweepSize;
+    constexpr size_t kNoRefsPermSize = 1024 * 1024 * 1024;  // 1 GB (M1g)
+    constexpr size_t kHeapSize       = kPermSize + kRequestSize + kMarkSweepSize + kNoRefsPermSize;
     constexpr size_t kCommitGrain    = 16 * 1024 * 1024;
     constexpr size_t kAllocCtxQuant  = 8 * 1024;
 
@@ -116,6 +117,14 @@ namespace
 
     Arena g_perm;
     Arena g_request;
+    // M1g: dedicated no-refs perm sub-arena. Same bump-allocator semantics as
+    // g_perm but the substrate REJECTS allocations with GC_ALLOC_CONTAINS_REF
+    // set (silently rerouting them to g_perm). By construction this arena
+    // cannot hold pointers into the mark-sweep region, so the M1e
+    // conservative cross-region scan is skipped over it. This is the
+    // "segregated no-refs perm" optimization: ref-free types promoted by
+    // the policy land here and pay zero scan cost per collection.
+    Arena g_norefsPerm;
 
     // ---- M1b: mark-sweep region ---------------------------------------------
     //
@@ -258,7 +267,8 @@ namespace
     static inline bool perm_or_request_range(uint8_t* p)
     {
         return (p >= g_perm.start && p < g_perm.end)
-            || (p >= g_request.start && p < g_request.end);
+            || (p >= g_request.start && p < g_request.end)
+            || (p >= g_norefsPerm.start && p < g_norefsPerm.end);
     }
 
     // Write a g_gc_pFreeObjectMethodTable filler covering the abandoned tail
@@ -363,10 +373,11 @@ namespace
     static_assert(sizeof(std::atomic<uint8_t>) == 1, "atomic<uint8_t> must be 1 byte");
 
     // Route values exposed through the public ABI; mirrored in C# as enum.
-    constexpr uint8_t kRouteDefault    = 0;
-    constexpr uint8_t kRouteForcePerm  = 1;
-    constexpr uint8_t kRouteForceReq   = 2;
-    constexpr uint8_t kRouteMarkSweep  = 3;
+    constexpr uint8_t kRouteDefault     = 0;
+    constexpr uint8_t kRouteForcePerm   = 1;
+    constexpr uint8_t kRouteForceReq    = 2;
+    constexpr uint8_t kRouteMarkSweep   = 3;
+    constexpr uint8_t kRouteNoRefsPerm  = 4;  // M1g: ref-free perm arena; not scanned
 
     SimpleGCMTEntry        g_mtTable[kMtTableCapacity];
     std::atomic<uint64_t>  g_mtAttributedObjects{0};
@@ -390,7 +401,7 @@ namespace
     // Per-route byte tally accumulated during a single mt_walk_chunk pass.
     // Reset at the start of each walk; consulted at the end if t_autoRoute
     // is enabled to decide whether to flip the thread's routing flags.
-    thread_local uint64_t t_routeTally[4] = {0, 0, 0, 0};
+    thread_local uint64_t t_routeTally[5] = {0, 0, 0, 0, 0};
 }
 
 // Public ABI struct exposed via simplegc_get_mt_stats. ABI version + size are
@@ -440,7 +451,7 @@ namespace
                 while (size > mx &&
                        !e.max_size.compare_exchange_weak(mx, size, std::memory_order_relaxed)) {}
                 uint8_t r = e.route.load(std::memory_order_relaxed);
-                if (r < 4) t_routeTally[r] += size;
+                if (r < 5) t_routeTally[r] += size;
                 return;
             }
             if (cur == nullptr)
@@ -463,7 +474,7 @@ namespace
                     e.count.fetch_add(1, std::memory_order_relaxed);
                     e.bytes.fetch_add(size, std::memory_order_relaxed);
                     uint8_t r = e.route.load(std::memory_order_relaxed);
-                    if (r < 4) t_routeTally[r] += size;
+                    if (r < 5) t_routeTally[r] += size;
                     return;
                 }
             }
@@ -585,7 +596,7 @@ namespace
             {
                 // Reset the per-route byte tally; mt_record will populate it
                 // as we walk.
-                t_routeTally[0] = t_routeTally[1] = t_routeTally[2] = t_routeTally[3] = 0;
+                t_routeTally[0] = t_routeTally[1] = t_routeTally[2] = t_routeTally[3] = t_routeTally[4] = 0;
                 mt_walk_chunk(t_chunkStart, alloc_ptr);
 
                 // Auto-routing: if the dominant route in the just-walked
@@ -594,13 +605,14 @@ namespace
                 if (t_autoRoute)
                 {
                     uint64_t total = t_routeTally[0] + t_routeTally[1] +
-                                     t_routeTally[2] + t_routeTally[3];
+                                     t_routeTally[2] + t_routeTally[3] +
+                                     t_routeTally[4];
                     if (total >= 1024)
                     {
                         // Find dominant non-default bucket.
                         uint8_t  best  = kRouteDefault;
                         uint64_t bestB = t_routeTally[kRouteDefault];
-                        for (uint8_t r = 1; r < 4; ++r)
+                        for (uint8_t r = 1; r < 5; ++r)
                         {
                             if (t_routeTally[r] > bestB)
                             {
@@ -775,6 +787,22 @@ static bool simplegc_init_heap()
     }
     g_marksweep.committed = msBase + ((kStartPadding + 4095) & ~static_cast<size_t>(4095));
 
+    // M1g: no-refs perm region — fourth sub-range of the same VirtualReserve,
+    // immediately after the mark-sweep region. Bump-allocator semantics
+    // (same as g_perm) but the substrate enforces "no GC pointers" at
+    // Alloc time via the GC_ALLOC_CONTAINS_REF flag.
+    uint8_t* nrpBase = msBase + kMarkSweepSize;
+    g_norefsPerm.start     = nrpBase;
+    g_norefsPerm.end       = nrpBase + kNoRefsPermSize;
+    g_norefsPerm.committed = g_norefsPerm.start;
+    g_norefsPerm.bump      = g_norefsPerm.start + kStartPadding;
+    if (!GCToOSInterface::VirtualCommit(g_norefsPerm.start, kStartPadding))
+    {
+        LOG1("VirtualCommit(norefsPerm start padding) failed");
+        return false;
+    }
+    g_norefsPerm.committed = g_norefsPerm.start + ((kStartPadding + 4095) & ~static_cast<size_t>(4095));
+
     // Side bitmap: 1 bit per kMarkBitGranularity bytes of the data area. We
     // size it for the FULL reserve so we never need to grow it.
     g_marksweep.mark_bits_size =
@@ -820,8 +848,8 @@ static bool simplegc_init_heap()
     }
 #endif
 
-    LOG1("heap reserved at %p .. %p (perm=%zu MB, request=%zu MB, marksweep=%zu MB)",
-         g_heapStart, g_heapEnd, kPermSize >> 20, kRequestSize >> 20, kMarkSweepSize >> 20);
+    LOG1("heap reserved at %p .. %p (perm=%zu MB, request=%zu MB, marksweep=%zu MB, norefsperm=%zu MB)",
+         g_heapStart, g_heapEnd, kPermSize >> 20, kRequestSize >> 20, kMarkSweepSize >> 20, kNoRefsPermSize >> 20);
     return true;
 }
 
@@ -1720,7 +1748,7 @@ public:
         if (lastRecordedMemLoadBytes)      *lastRecordedMemLoadBytes = 0;
         if (lastRecordedHeapSizeBytes)     *lastRecordedHeapSizeBytes = g_totalAllocated.load();
         if (lastRecordedFragmentationBytes)*lastRecordedFragmentationBytes = 0;
-        if (totalCommittedBytes)           *totalCommittedBytes = (size_t)((g_perm.committed - g_perm.start) + (g_request.committed - g_request.start));
+        if (totalCommittedBytes)           *totalCommittedBytes = (size_t)((g_perm.committed - g_perm.start) + (g_request.committed - g_request.start) + (g_norefsPerm.committed - g_norefsPerm.start));
         if (promotedBytes)                 *promotedBytes = 0;
         if (pinnedObjectCount)             *pinnedObjectCount = 0;
         if (finalizationPendingCount)      *finalizationPendingCount = 0;
@@ -2030,11 +2058,34 @@ public:
             return reinterpret_cast<Object*>(slot);
         }
 
-        // Bump-pointer (perm or request) path. Force-route caller-overrides
-        // win over the request bracket: kRouteForcePerm always lands in perm
-        // even if a request bracket is active.
-        Arena& targetArena =
-            (effRoute == kRouteForceReq && t_activeArena != nullptr) ? *t_activeArena : g_perm;
+        // Bump-pointer (perm / norefsPerm / request) path. Force-route
+        // caller-overrides win over the request bracket: kRouteForcePerm
+        // always lands in perm even if a request bracket is active.
+        //
+        // M1g soundness rule: kRouteNoRefsPerm is honored ONLY when the
+        // runtime tells us the allocation has no GC pointers
+        // (GC_ALLOC_CONTAINS_REF is clear). Otherwise we silently re-route
+        // to g_perm. This keeps g_norefsPerm provably free of MS-pointing
+        // refs at all times, which lets the M1e cross-region scan skip it
+        // entirely.
+        if (effRoute == kRouteNoRefsPerm && (flags & GC_ALLOC_CONTAINS_REF))
+        {
+            effRoute = kRouteForcePerm;
+        }
+        Arena* targetArenaPtr;
+        if (effRoute == kRouteForceReq && t_activeArena != nullptr)
+        {
+            targetArenaPtr = t_activeArena;
+        }
+        else if (effRoute == kRouteNoRefsPerm)
+        {
+            targetArenaPtr = &g_norefsPerm;
+        }
+        else
+        {
+            targetArenaPtr = &g_perm;
+        }
+        Arena& targetArena = *targetArenaPtr;
 
         size_t baseChunkSize = (size > kAllocCtxQuant) ? size : kAllocCtxQuant;
         // M1e: reserve `slack` bytes at the end of every chunk we hand out.
@@ -2082,7 +2133,9 @@ public:
         {
             LOG1("Alloc[%d] size=%zu flags=0x%x arena=%s -> %p (acontext=%p)",
                  s_traceCount, size, flags,
-                 (&targetArena == &g_request) ? "request" : "perm",
+                 (&targetArena == &g_request)     ? "request" :
+                 (&targetArena == &g_norefsPerm)  ? "norefsperm" :
+                                                    "perm",
                  chunk, acontext);
         }
 
@@ -2172,8 +2225,16 @@ public:
     unsigned int GetGenerationWithRange(Object*, uint8_t** ppStart, uint8_t** ppAllocated, uint8_t** ppReserved) override
     {
         if (ppStart)     *ppStart     = g_heapStart;
-        // Allocated high-water = max of perm.bump and request.bump (we can't
-        // sensibly report two ranges through this single accessor).
+        // Allocated high-water across our bump arenas. NOTE: g_norefsPerm
+        // is intentionally EXCLUDED here — its base address sits past
+        // perm+request+marksweep (~1.5 GB into the reserve) so even an
+        // empty norefsPerm would inflate ppAllocated by an order of
+        // magnitude. The runtime uses this range for write-barrier card
+        // table coverage, and an inflated value perturbs allocator
+        // behavior on unrelated paths (observed: it dramatically reduced
+        // perm→MS reference visibility under M1e's conservative scan).
+        // norefsPerm contains no GC pointers by construction, so leaving
+        // it out of the high-water is sound.
         if (ppAllocated) *ppAllocated = (g_request.bump > g_perm.bump) ? g_request.bump : g_perm.bump;
         if (ppReserved)  *ppReserved  = g_heapEnd;
         return 0;
@@ -2276,7 +2337,14 @@ HRESULT simplegc_force_collect()
         ms_build_object_start_index();
         ms_walk_arena_for_external_refs(g_perm);
         ms_walk_arena_for_external_refs(g_request);
-        LOG1("force_collect: phase=drain-gray");
+        // M1g: g_norefsPerm is INTENTIONALLY skipped. The substrate refuses
+        // any allocation with GC_ALLOC_CONTAINS_REF set into this arena
+        // (silently re-routing to g_perm), so by construction norefsPerm
+        // contains no fields that could point at MS objects. Skipping the
+        // conservative scan here is the optimization that lets the
+        // policy's perm-promotion strategy pay off when the cache grows.
+        LOG1("force_collect: phase=drain-gray (norefsPerm skipped: %zu bytes)",
+             (size_t)(g_norefsPerm.bump - g_norefsPerm.start));
 
         // Trace the live closure (also bumps per-MT survival).
         ms_drain_gray_queue();
@@ -2533,6 +2601,18 @@ simplegc_get_arena_stats(uint64_t* outPermBytesUsed,
     if (outPermBytesCommitted)    *outPermBytesCommitted    = (uint64_t)(g_perm.committed - g_perm.start);
     if (outRequestBytesUsed)      *outRequestBytesUsed      = (uint64_t)(g_request.bump - g_request.start);
     if (outRequestBytesCommitted) *outRequestBytesCommitted = (uint64_t)(g_request.committed - g_request.start);
+}
+
+// M1g: stats for the no-refs perm sub-arena. Returns the number of bytes
+// allocated into and committed by g_norefsPerm — used by the demo to report
+// how much of the long-lived heap landed in the optimized arena.
+GC_EXPORT
+void LOCALGC_CALLCONV
+simplegc_get_norefsperm_stats(uint64_t* outBytesUsed,
+                              uint64_t* outBytesCommitted)
+{
+    if (outBytesUsed)      *outBytesUsed      = (uint64_t)(g_norefsPerm.bump - g_norefsPerm.start);
+    if (outBytesCommitted) *outBytesCommitted = (uint64_t)(g_norefsPerm.committed - g_norefsPerm.start);
 }
 
 // ---------------------------------------------------------------------------
@@ -2794,7 +2874,7 @@ uint32_t LOCALGC_CALLCONV
 simplegc_set_route(uint64_t mt_token, uint8_t route)
 {
     if (mt_token == 0) return 0;
-    if (route > kRouteMarkSweep) return 0;
+    if (route > kRouteNoRefsPerm) return 0;
     MethodTable* mt = (MethodTable*)mt_token;
     size_t h = mt_hash(mt);
     for (size_t i = 0; i < kMtTableCapacity; ++i)
@@ -2861,7 +2941,7 @@ GC_EXPORT
 void LOCALGC_CALLCONV
 simplegc_set_default_route(int32_t route)
 {
-    if (route < 0 || route > kRouteMarkSweep) return;
+    if (route < 0 || route > kRouteNoRefsPerm) return;
     g_defaultRoute.store(static_cast<uint8_t>(route), std::memory_order_release);
 }
 
@@ -2880,7 +2960,7 @@ GC_EXPORT
 void LOCALGC_CALLCONV
 simplegc_set_thread_route(int32_t route)
 {
-    if (route < 0 || route > kRouteMarkSweep) return;
+    if (route < 0 || route > kRouteNoRefsPerm) return;
     t_forceRoute = static_cast<uint8_t>(route);
 }
 

@@ -84,6 +84,13 @@ public static class SimpleGCInterop
     [DllImport(Lib, EntryPoint = "simplegc_get_marksweep_stats")]
     public static extern unsafe void GetMarkSweepStats(MarkSweepStats* outBuf);
 
+    /// <summary>Snapshot of the no-refs perm sub-arena (M1g): bytes
+    /// bump-allocated and bytes committed. Used by demos to report how much
+    /// of the long-lived heap landed in the optimized arena that the
+    /// conservative cross-region scan is allowed to skip.</summary>
+    [DllImport(Lib, EntryPoint = "simplegc_get_norefsperm_stats")]
+    public static extern unsafe void GetNoRefsPermStats(out ulong bytesUsed, out ulong bytesCommitted);
+
     /// <summary>Begin a per-request scope. All allocations until
     /// <see cref="RequestEnd"/> are routed to the request arena and are
     /// reclaimed in O(1) on scope end. Returns the snapshot bump position
