@@ -1548,17 +1548,29 @@ namespace
 // SimpleHandleStore / SimpleHandleManager
 // ---------------------------------------------------------------------------
 //
-// We back handles with a vector<Object*>. The OBJECTHANDLE is the address of
-// the slot. This is safe as long as the vector never reallocates — we use a
-// chunked storage strategy.
+// We back handles with a vector<Slot> where each slot is a pair
+// (primary, secondary). The OBJECTHANDLE is the address of the primary; the
+// secondary lives at handle + sizeof(Object*) and is only used by dependent
+// handles (ConditionalWeakTable, Monitor's per-object Conditions, etc.).
+// Non-dependent handles leave secondary == nullptr.
+//
+// This pair-per-slot layout costs 8 bytes per non-dependent handle but is
+// the simplest design that lets us implement Get/SetDependentHandleSecondary
+// correctly without a parallel side table.
 
 namespace simplegc_handles
 {
     constexpr size_t kBucketSize = 4096;
 
+    struct Slot
+    {
+        Object* primary;
+        Object* secondary;
+    };
+
     struct Bucket
     {
-        Object* slots[kBucketSize];
+        Slot slots[kBucketSize];
         Bucket() { memset(slots, 0, sizeof(slots)); }
     };
 
@@ -1566,7 +1578,7 @@ namespace simplegc_handles
     std::vector<Bucket*>     g_buckets;
     size_t                   g_nextSlot = 0; // grows monotonically; we never reclaim
 
-    static OBJECTHANDLE alloc_slot(Object* initial)
+    static OBJECTHANDLE alloc_slot(Object* primary, Object* secondary = nullptr)
     {
         std::lock_guard<std::mutex> guard(g_handleLock);
         size_t bucketIdx = g_nextSlot / kBucketSize;
@@ -1576,16 +1588,31 @@ namespace simplegc_handles
             g_buckets.push_back(new Bucket());
         }
         Bucket* b = g_buckets[bucketIdx];
-        b->slots[inIdx] = initial;
-        OBJECTHANDLE h = reinterpret_cast<OBJECTHANDLE>(&b->slots[inIdx]);
+        b->slots[inIdx].primary   = primary;
+        b->slots[inIdx].secondary = secondary;
+        OBJECTHANDLE h = reinterpret_cast<OBJECTHANDLE>(&b->slots[inIdx].primary);
         ++g_nextSlot;
         return h;
+    }
+
+    // Given an OBJECTHANDLE pointing at the primary slot, return a pointer
+    // to the matching secondary slot (immediately after the primary in the
+    // Slot pair). Safe because each Slot is a contiguous (primary,secondary)
+    // pair and the handle is the address of the primary.
+    static Object** secondary_slot(OBJECTHANDLE h)
+    {
+        return reinterpret_cast<Object**>(reinterpret_cast<uint8_t*>(h) + sizeof(Object*));
     }
 }
 
 // Definition of ms_scan_handle_store (declared above in the unnamed namespace
-// containing the other ms_* helpers). Each non-null slot is treated as a
-// strong reference into our region.
+// containing the other ms_* helpers). Both primary and secondary slots are
+// treated as strong references into our region. For dependent handles this is
+// a conservative over-approximation (the secondary should logically only be
+// kept alive while the primary is reachable); we accept the small extra
+// retention in exchange for simplicity and to guarantee CWT-stored values
+// (e.g., Monitor's per-object Conditions) stay alive as long as anyone is
+// using the table.
 namespace
 {
     void ms_scan_handle_store()
@@ -1596,13 +1623,18 @@ namespace
         {
             size_t bucketIdx = i / simplegc_handles::kBucketSize;
             size_t inIdx     = i % simplegc_handles::kBucketSize;
-            Object* obj = simplegc_handles::g_buckets[bucketIdx]->slots[inIdx];
-            if (obj == nullptr) continue;
-            uint8_t* p = reinterpret_cast<uint8_t*>(obj);
-            if (!ms_in_region(p)) continue;
-            if (ms_test_and_set_mark(p))
+            simplegc_handles::Slot& slot =
+                simplegc_handles::g_buckets[bucketIdx]->slots[inIdx];
+            Object* refs[2] = { slot.primary, slot.secondary };
+            for (Object* obj : refs)
             {
-                g_grayQueue.push_back(p);
+                if (obj == nullptr) continue;
+                uint8_t* p = reinterpret_cast<uint8_t*>(obj);
+                if (!ms_in_region(p)) continue;
+                if (ms_test_and_set_mark(p))
+                {
+                    g_grayQueue.push_back(p);
+                }
             }
         }
     }
@@ -1619,8 +1651,8 @@ public:
     { TRACE_METHOD(); return simplegc_handles::alloc_slot(obj); }
     OBJECTHANDLE CreateHandleWithExtraInfo(Object* obj, HandleType, void*) override
     { TRACE_METHOD(); return simplegc_handles::alloc_slot(obj); }
-    OBJECTHANDLE CreateDependentHandle(Object* primary, Object* /*secondary*/) override
-    { TRACE_METHOD(); return simplegc_handles::alloc_slot(primary); }
+    OBJECTHANDLE CreateDependentHandle(Object* primary, Object* secondary) override
+    { TRACE_METHOD(); return simplegc_handles::alloc_slot(primary, secondary); }
 };
 
 static SimpleHandleStore* g_globalHandleStore = nullptr;
@@ -1648,12 +1680,20 @@ public:
     void DestroyHandleOfType(OBJECTHANDLE handle, HandleType) override
     {
         TRACE_METHOD();
-        if (handle != nullptr) *reinterpret_cast<Object**>(handle) = nullptr;
+        if (handle != nullptr)
+        {
+            *reinterpret_cast<Object**>(handle) = nullptr;
+            *simplegc_handles::secondary_slot(handle) = nullptr;
+        }
     }
     void DestroyHandleOfUnknownType(OBJECTHANDLE handle) override
     {
         TRACE_METHOD();
-        if (handle != nullptr) *reinterpret_cast<Object**>(handle) = nullptr;
+        if (handle != nullptr)
+        {
+            *reinterpret_cast<Object**>(handle) = nullptr;
+            *simplegc_handles::secondary_slot(handle) = nullptr;
+        }
     }
 
     void  SetExtraInfoForHandle(OBJECTHANDLE, HandleType, void*) override { TRACE_METHOD(); }
@@ -1671,8 +1711,10 @@ public:
         if (*slot == nullptr) { *slot = obj; return true; }
         return false;
     }
-    void SetDependentHandleSecondary(OBJECTHANDLE, Object*) override { TRACE_METHOD(); }
-    Object* GetDependentHandleSecondary(OBJECTHANDLE) override { TRACE_METHOD(); return nullptr; }
+    void SetDependentHandleSecondary(OBJECTHANDLE handle, Object* secondary) override
+    { TRACE_METHOD(); *simplegc_handles::secondary_slot(handle) = secondary; }
+    Object* GetDependentHandleSecondary(OBJECTHANDLE handle) override
+    { TRACE_METHOD(); return *simplegc_handles::secondary_slot(handle); }
 
     Object* InterlockedCompareExchangeObjectInHandle(OBJECTHANDLE handle, Object* obj, Object* comparand) override
     {
