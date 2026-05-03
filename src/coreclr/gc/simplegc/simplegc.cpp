@@ -130,6 +130,36 @@ namespace
     constexpr size_t kSubArenaSizeDefault = 256 * 1024;
     size_t           kSubArenaSize        = kSubArenaSizeDefault;
 
+    // M1m.2: opt-in incremental perm walk. When SIMPLEGC_PERM_IMMUTABLE=1,
+    // the GC trusts that perm-arena object contents are never mutated to
+    // store new cross-region references after the previous walk completed.
+    // Then on each collect we only scan [g_permWalkedHigh, perm.bump),
+    // which is typically 0 bytes after warmup for steady-state workloads
+    // (when SIMPLEGC_DEFAULT_ROUTE=marksweep, perm receives only startup
+    // allocations and a tiny trickle of runtime-internal objects).
+    //
+    // SAFETY CONTRACT (caller responsibility): with NO WRITE BARRIERS, the
+    // GC cannot detect a perm field write that mutates an existing perm
+    // object to point at a freshly allocated MS object. If the workload
+    // mutates perm fields after a walk, those MS objects can be missed
+    // and incorrectly swept, leading to torn references and AVs.
+    //
+    // Validated SAFE on:
+    //   - policy-demo grow (single-thread, no runtime infrastructure churn:
+    //     perm content is JIT startup state, immutable thereafter).
+    //
+    // Validated UNSAFE on:
+    //   - Fortunes / Kestrel (HTTP machinery, HttpClient, header caches,
+    //     dispatch tables get mutated after warmup → AV). General .NET
+    //     runtime workloads cannot satisfy this contract without barriers.
+    //
+    // Default-off; user must explicitly opt in. This is a building block
+    // for future safer designs (card tables for perm; per-MT immutability
+    // tags); it is NOT a generally enabled optimization.
+    bool   g_permImmutableOptIn = false;
+    uint8_t* g_permWalkedHigh   = nullptr;   // highest-scanned perm.bump
+    uint8_t* g_requestWalkedHigh= nullptr;   // highest-scanned request.bump
+
     // Each arena owns its own bump pointer, committed-watermark, and lock.
     struct Arena
     {
@@ -1025,6 +1055,18 @@ static bool simplegc_init_heap()
             }
         }
     }
+    // M1m.2: SIMPLEGC_PERM_IMMUTABLE=1 opts into the incremental
+    // perm/request walk (only scan the high-water portion since the
+    // last walk). See declaration of g_permImmutableOptIn for the
+    // correctness contract.
+    if (const char* v = std::getenv("SIMPLEGC_PERM_IMMUTABLE"))
+    {
+        if (*v != '\0' && *v != '0')
+        {
+            g_permImmutableOptIn = true;
+            LOG1("SIMPLEGC_PERM_IMMUTABLE=1 (incremental perm walk enabled)");
+        }
+    }
     // ---- M1m.1: cap-aware auto-tune from DOTNET_GCHeapHardLimit ----
     // When the runtime is configured with a hard heap-size limit (typical
     // for containers), auto-engage the policy-mode defaults so plain
@@ -1618,11 +1660,14 @@ namespace
     //   * EE is suspended.
     //   * ms_build_object_start_index() has been invoked for this collection.
     //   * MT-parsing of perm objects is intentionally NOT used here.
-    static void ms_walk_arena_for_external_refs(Arena& arena)
+    static void ms_walk_arena_for_external_refs(Arena& arena,
+                                                uint8_t* startOverride = nullptr)
     {
         constexpr size_t kStartPadding = 64; // matches GC_Initialize layout
         if (arena.start == nullptr) return;
-        uint8_t* p   = arena.start + kStartPadding;
+        uint8_t* p = (startOverride != nullptr)
+                         ? startOverride
+                         : (arena.start + kStartPadding);
         uint8_t* end = arena.bump;
         // Align p down to 8 bytes (it should already be 8-aligned because
         // kStartPadding is 64; defensive in case GC_Initialize ever changes).
@@ -2934,8 +2979,30 @@ HRESULT simplegc_force_collect()
         uint64_t requestWalkBytes = (uint64_t)(g_request.bump - g_request.start);
         g_phaseTimes.last_perm_walk_bytes.store(permWalkBytes, std::memory_order_relaxed);
         g_phaseTimes.last_request_walk_bytes.store(requestWalkBytes, std::memory_order_relaxed);
-        ms_walk_arena_for_external_refs(g_perm);
-        ms_walk_arena_for_external_refs(g_request);
+        // M1m.2: when the user opts into perm-immutable, walk only the
+        // high-water portion since the last collect. This brings the
+        // common case (steady-state perm with default route=marksweep)
+        // from 60-100ms/walk to ~0ms/walk.
+        //
+        // Defensive: if a bump pointer regressed below the watermark (e.g.
+        // request rewind via simplegc_request_end), drop the watermark to
+        // arena.start so we re-scan everything currently live in the arena.
+        // Missing this would skip new allocations under the old high.
+        if (g_permImmutableOptIn)
+        {
+            if (g_permWalkedHigh    > g_perm.bump)    g_permWalkedHigh    = nullptr;
+            if (g_requestWalkedHigh > g_request.bump) g_requestWalkedHigh = nullptr;
+        }
+        uint8_t* permWalkStart    = g_permImmutableOptIn ? g_permWalkedHigh    : nullptr;
+        uint8_t* requestWalkStart = g_permImmutableOptIn ? g_requestWalkedHigh : nullptr;
+        ms_walk_arena_for_external_refs(g_perm,    permWalkStart);
+        ms_walk_arena_for_external_refs(g_request, requestWalkStart);
+        if (g_permImmutableOptIn)
+        {
+            // Record high-watermark for next collect.
+            g_permWalkedHigh    = g_perm.bump;
+            g_requestWalkedHigh = g_request.bump;
+        }
         // M1g: g_norefsPerm is INTENTIONALLY skipped. The substrate refuses
         // any allocation with GC_ALLOC_CONTAINS_REF set into this arena
         // (silently re-routing to g_perm), so by construction norefsPerm
