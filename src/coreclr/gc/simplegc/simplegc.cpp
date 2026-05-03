@@ -25,6 +25,7 @@
 #include <vector>
 #include <mutex>
 #include <algorithm>
+#include <chrono>
 
 #ifdef _MSC_VER
 #define DLLEXPORT __declspec(dllexport)
@@ -106,7 +107,11 @@ namespace
     // demonstrate graceful operation under ~64-96 MB process memory caps
     // where the default GC's working set already exceeds the cap.
     constexpr size_t kCommitGrain    = 1 * 1024 * 1024;
-    constexpr size_t kAllocCtxQuant  = 8 * 1024;
+    constexpr size_t kAllocCtxQuantDefault = 8 * 1024;
+    // M1l measure: chunk size affects MS-allocation slow-path frequency.
+    // Bigger chunks = fewer chunk-takes = less g_marksweep.lock contention,
+    // at the cost of higher per-chunk slack waste. Tune via env at startup.
+    size_t            kAllocCtxQuant       = kAllocCtxQuantDefault;
 
     // Each arena owns its own bump pointer, committed-watermark, and lock.
     struct Arena
@@ -168,6 +173,7 @@ namespace
         std::atomic<uint64_t> bytes_freelist{0};
         std::atomic<uint64_t> bytes_live_after_collect{0};
         std::atomic<uint64_t> bytes_collected_total{0};
+        std::atomic<uint64_t> bytes_bump_rewound{0};
         std::atomic<uint64_t> n_collections{0};
         std::atomic<uint64_t> n_objects_allocated{0};
         std::atomic<uint64_t> n_objects_swept{0};
@@ -358,6 +364,34 @@ namespace
     std::atomic<uint64_t> g_bytesAtLastAutoCollect{0};
     std::atomic<uint64_t> g_autoCollectCount{0};
     constexpr uint64_t kAutoCollectThrottleBytes = 16 * 1024 * 1024; // 16 MB
+
+    // M1l measure: per-phase timing accumulators (microseconds). Updated by
+    // simplegc_force_collect so we can quantify where collect time is spent
+    // (perm scan vs sweep vs root scan) before deciding which substrate to
+    // optimize first. Dumped to stderr after each collect at LOG1.
+    struct PhaseTimes
+    {
+        std::atomic<uint64_t> fix_alloc_us{0};
+        std::atomic<uint64_t> scan_roots_us{0};
+        std::atomic<uint64_t> walk_arenas_us{0};
+        std::atomic<uint64_t> drain_gray_us{0};
+        std::atomic<uint64_t> sweep_us{0};
+        std::atomic<uint64_t> total_us{0};
+        std::atomic<uint64_t> collects{0};
+        // Last-collect snapshot of perm/request walked sizes (bytes), to
+        // correlate walk_arenas_us with the scanned region size.
+        std::atomic<uint64_t> last_perm_walk_bytes{0};
+        std::atomic<uint64_t> last_request_walk_bytes{0};
+    };
+    PhaseTimes g_phaseTimes;
+
+    // M1l measure: MS slow-path entry counters. ms_slow_calls counts every
+    // chunk-take attempt, ms_slow_lock_us aggregates time spent inside
+    // g_marksweep.lock across all chunk-takes. Together with bytes_allocated
+    // they let us compute average chunk-take latency under c=16 to see
+    // whether mutex contention is the throughput bottleneck.
+    std::atomic<uint64_t> g_msSlowCalls{0};
+    std::atomic<uint64_t> g_msSlowLockUs{0};
 
     // Single-collection-at-a-time gate. Replaces the `g_marksweep.lock`
     // bracket previously used at the top of simplegc_force_collect.
@@ -917,6 +951,22 @@ static bool simplegc_init_heap()
         {
             g_defaultRoute.store(kRouteMarkSweep, std::memory_order_release);
             LOG1("SIMPLEGC_DEFAULT_ROUTE=marksweep");
+        }
+    }
+    // M1l measure: SIMPLEGC_CHUNK_KB tunes the MS chunk-take size.
+    // Default 8 KB (kAllocCtxQuantDefault). Bigger reduces lock contention
+    // on g_marksweep.lock but increases per-chunk slack waste under tight caps.
+    if (const char* v = std::getenv("SIMPLEGC_CHUNK_KB"))
+    {
+        if (*v != '\0')
+        {
+            uint64_t kb = std::strtoull(v, nullptr, 10);
+            if (kb >= 1 && kb <= 1024)
+            {
+                kAllocCtxQuant = (size_t)(kb * 1024);
+                LOG1("SIMPLEGC_CHUNK_KB=%llu (kAllocCtxQuant=%zu bytes)",
+                     (unsigned long long)kb, kAllocCtxQuant);
+            }
         }
     }
     return true;
@@ -1586,6 +1636,36 @@ namespace
                     run += nsize;
                     q += nsize;
                 }
+                // M1l: bump-reset.
+                //
+                // If this dead run extends all the way to the bump pointer,
+                // every byte from `p` onward is reclaimable. Rewind bump
+                // instead of pushing onto the freelist.
+                //
+                // Cache-locality benefit: chunks taken after this collect
+                // bump-allocate from `p` (warm, recently-touched memory)
+                // instead of pushing further into cold pages near the
+                // committed high-water mark. On Fortunes (Kestrel), our
+                // walk-arena cost scales with `bump - start_obj`; rewind
+                // also makes future walks cheaper.
+                //
+                // Memory hygiene: zero the rewound tail. ms_raw_bump does
+                // NOT zero its return (it relies on VirtualCommit returning
+                // zero pages on first commit), so without this memset, a
+                // subsequent ms_raw_bump in the rewound region would hand
+                // out stale post-sweep memory to the runtime.
+                //
+                // Safe under STW: this runs in force_collect after
+                // SuspendEE. All alloc contexts have been "fixed"
+                // (alloc_ptr == alloc_limit) so no thread holds a chunk
+                // overlapping the rewound region.
+                if (q == end)
+                {
+                    memset(p, 0, run);
+                    g_marksweep.bump = p;
+                    g_marksweep.bytes_bump_rewound.fetch_add(run, std::memory_order_relaxed);
+                    break;
+                }
                 if (run >= ms_free_object_min_size())
                 {
                     ms_freelist_push(p, run);
@@ -2224,6 +2304,8 @@ public:
 
             uint8_t* chunk = nullptr;
             {
+                using ms_clock = std::chrono::steady_clock;
+                auto tLockStart = ms_clock::now();
                 std::lock_guard<std::mutex> guard(g_marksweep.lock);
                 chunk = ms_freelist_take(chunkSize);
                 if (chunk == nullptr)
@@ -2248,6 +2330,10 @@ public:
                         chunkSize     = smallChunkSize;
                     }
                 }
+                auto tLockEnd = ms_clock::now();
+                uint64_t lockUs = (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(tLockEnd - tLockStart).count();
+                g_msSlowLockUs.fetch_add(lockUs, std::memory_order_relaxed);
+                g_msSlowCalls.fetch_add(1, std::memory_order_relaxed);
             }
             if (chunk == nullptr)
             {
@@ -2531,6 +2617,12 @@ HRESULT simplegc_force_collect()
         // needed.
         GCToEEInterface::SuspendEE(SUSPEND_FOR_GC);
 
+        // M1l measure: per-phase timing instrumentation. Captures wall-clock
+        // microseconds for each force_collect phase so we can quantify the
+        // bottleneck before picking parallel-mark vs card-table.
+        using ms_clock = std::chrono::steady_clock;
+        auto t0 = ms_clock::now();
+
         // M1e: encode every cached chunk's abandoned tail as a free-object
         // filler and zero the alloc-context pointers. After this loop, every
         // byte from start + 64 to bump in g_perm and g_request is either a
@@ -2543,6 +2635,7 @@ HRESULT simplegc_force_collect()
         LOG1("force_collect: phase=fix-alloc-contexts");
         GCToEEInterface::GcEnumAllocContexts(&simplegc_gc_fix_alloc_context_cb,
                                              nullptr);
+        auto t1 = ms_clock::now();
         LOG1("force_collect: phase=scan-roots");
 
         // Reset per-collection survival counters on every populated MT entry. The
@@ -2560,15 +2653,18 @@ HRESULT simplegc_force_collect()
         // Clear mark bits and gray queue.
         memset(g_marksweep.mark_bits, 0, g_marksweep.mark_bits_size);
         g_grayQueue.clear();
+        auto t1a = ms_clock::now();   // after mt_table reset + mark-bits memset
 
         // Collect roots from managed stacks, statics, and runtime-internal sources.
         ScanContext sc{};
         sc.promotion = TRUE;
         sc.concurrent = FALSE;
         GCToEEInterface::GcScanRoots(&ms_promote_callback, /*condemned*/ 2, /*max_gen*/ 2, &sc);
+        auto t1b = ms_clock::now();   // after GcScanRoots (runtime-side)
 
         // Add our own handle store as roots.
         ms_scan_handle_store();
+        auto t2 = ms_clock::now();    // after ms_scan_handle_store
         LOG1("force_collect: phase=walk-arenas");
 
         // M1e: walk the perm and request arenas to discover cross-region
@@ -2586,6 +2682,10 @@ HRESULT simplegc_force_collect()
         // CGCDesc layout of arbitrary perm-arena objects (some of which
         // are runtime-internal types our parser mishandles).
         ms_build_object_start_index();
+        uint64_t permWalkBytes    = (uint64_t)(g_perm.bump    - g_perm.start);
+        uint64_t requestWalkBytes = (uint64_t)(g_request.bump - g_request.start);
+        g_phaseTimes.last_perm_walk_bytes.store(permWalkBytes, std::memory_order_relaxed);
+        g_phaseTimes.last_request_walk_bytes.store(requestWalkBytes, std::memory_order_relaxed);
         ms_walk_arena_for_external_refs(g_perm);
         ms_walk_arena_for_external_refs(g_request);
         // M1g: g_norefsPerm is INTENTIONALLY skipped. The substrate refuses
@@ -2594,11 +2694,13 @@ HRESULT simplegc_force_collect()
         // contains no fields that could point at MS objects. Skipping the
         // conservative scan here is the optimization that lets the
         // policy's perm-promotion strategy pay off when the cache grows.
+        auto t3 = ms_clock::now();
         LOG1("force_collect: phase=drain-gray (norefsPerm skipped: %zu bytes)",
              (size_t)(g_norefsPerm.bump - g_norefsPerm.start));
 
         // Trace the live closure (also bumps per-MT survival).
         ms_drain_gray_queue();
+        auto t4 = ms_clock::now();
         LOG1("force_collect: phase=sweep");
 
         // Sweep dead objects into the freelist.
@@ -2614,6 +2716,60 @@ HRESULT simplegc_force_collect()
                 g_mtTable[i].age_collections.fetch_add(1, std::memory_order_relaxed);
             }
         }
+
+        auto t5 = ms_clock::now();
+
+        // Accumulate per-phase microseconds. All deltas are non-negative
+        // because we capture timestamps in monotonic order.
+        auto us = [](ms_clock::time_point a, ms_clock::time_point b) -> uint64_t {
+            return (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(b - a).count();
+        };
+        uint64_t fixUs       = us(t0, t1);
+        uint64_t scanResetUs = us(t1, t1a);
+        uint64_t scanRootsUs = us(t1a, t1b);
+        uint64_t scanHandlesUs = us(t1b, t2);
+        uint64_t scanUs      = us(t1, t2);
+        uint64_t walkUs      = us(t2, t3);
+        uint64_t drainUs     = us(t3, t4);
+        uint64_t sweepUs     = us(t4, t5);
+        uint64_t totalUs     = us(t0, t5);
+        g_phaseTimes.fix_alloc_us  .fetch_add(fixUs,   std::memory_order_relaxed);
+        g_phaseTimes.scan_roots_us .fetch_add(scanUs,  std::memory_order_relaxed);
+        g_phaseTimes.walk_arenas_us.fetch_add(walkUs,  std::memory_order_relaxed);
+        g_phaseTimes.drain_gray_us .fetch_add(drainUs, std::memory_order_relaxed);
+        g_phaseTimes.sweep_us      .fetch_add(sweepUs, std::memory_order_relaxed);
+        g_phaseTimes.total_us      .fetch_add(totalUs, std::memory_order_relaxed);
+        g_phaseTimes.collects      .fetch_add(1,       std::memory_order_relaxed);
+
+        // Always log the per-collect breakdown (LOG1) so harnesses can grep
+        // it. Includes scanned arena sizes so we can correlate walk time
+        // with region size and compute scan throughput. scan-roots is split
+        // into reset (mt-table + mark-bits memset) / runtime-side GcScanRoots
+        // / our own ms_scan_handle_store.
+        // Always log the per-collect breakdown (LOG1) so harnesses can grep
+        // it. Includes scanned arena sizes so we can correlate walk time
+        // with region size and compute scan throughput. scan-roots is split
+        // into reset (mt-table + mark-bits memset) / runtime-side GcScanRoots
+        // / our own ms_scan_handle_store.
+        uint64_t cumSlowCalls  = g_msSlowCalls .load(std::memory_order_relaxed);
+        uint64_t cumSlowLockUs = g_msSlowLockUs.load(std::memory_order_relaxed);
+        uint64_t cumRewound    = g_marksweep.bytes_bump_rewound.load(std::memory_order_relaxed);
+        uint64_t bumpAfter     = (uint64_t)(g_marksweep.bump - g_marksweep.start_obj);
+        LOG1("force_collect: phase_us fix=%llu scan=%llu (reset=%llu rtRoots=%llu handles=%llu) walk=%llu drain=%llu sweep=%llu total=%llu  permBytes=%llu requestBytes=%llu  cumSlowCalls=%llu cumSlowLockUs=%llu (avg=%llu ns)  bumpAfter=%llu cumRewound=%llu",
+             (unsigned long long)fixUs,
+             (unsigned long long)scanUs,
+             (unsigned long long)scanResetUs,
+             (unsigned long long)scanRootsUs,
+             (unsigned long long)scanHandlesUs,
+             (unsigned long long)walkUs,  (unsigned long long)drainUs,
+             (unsigned long long)sweepUs, (unsigned long long)totalUs,
+             (unsigned long long)permWalkBytes,
+             (unsigned long long)requestWalkBytes,
+             (unsigned long long)cumSlowCalls,
+             (unsigned long long)cumSlowLockUs,
+             (unsigned long long)(cumSlowCalls ? (cumSlowLockUs * 1000ULL / cumSlowCalls) : 0),
+             (unsigned long long)bumpAfter,
+             (unsigned long long)cumRewound);
 
         GCToEEInterface::RestartEE(/*bFinishedGC*/ true);
     }   // <-- scope-end (was: release g_marksweep.lock here).
