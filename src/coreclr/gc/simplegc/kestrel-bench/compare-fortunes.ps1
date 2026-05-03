@@ -141,11 +141,21 @@ function Run-One {
     }
     # else 'default': leave env empty so runtime uses regular GC.
 
+    # M1m.1: surface the cap to the runtime as DOTNET_GCHeapHardLimit so
+    # both default GC and simplegc's auto-tune can engage. The harness's
+    # Job Object cap (--mem-mb) is enforced externally; this gives the
+    # GC visibility into the same number. Set for every mode so the
+    # comparison is apples-to-apples.
+    if ($CapMb -gt 0) {
+        $envBlock['DOTNET_GCHeapHardLimit'] = ('0x{0:X}' -f ([long]$CapMb * 1MB))
+    }
+
     $args = @('--ep', $Endpoint, '--c', $C, '--n', $N)
     if ($CapMb -gt 0) { $args += @('--mem-mb', $CapMb) }
 
     # Apply env, run, capture, restore. Snapshot prior values for restore.
     $envKeys = @('DOTNET_GCName','DOTNET_StandaloneGCName',
+                 'DOTNET_GCHeapHardLimit',
                  'SIMPLEGC_DEFAULT_ROUTE','SIMPLEGC_AUTO_COLLECT_MB',
                  'SIMPLEGC_SUB_ARENA_KB')
     $prior = @{}

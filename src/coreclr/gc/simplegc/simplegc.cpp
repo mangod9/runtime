@@ -969,6 +969,9 @@ static bool simplegc_init_heap()
     //   otherwise default to perm get routed to the collectible MS
     //   region instead. Without this, auto-collect has no work to do
     //   because everything sits in (uncollectible) perm.
+    bool autoCollectUserSet = false;
+    bool defaultRouteUserSet = false;
+    bool subArenaUserSet = false;
     if (const char* v = std::getenv("SIMPLEGC_AUTO_COLLECT_MB"))
     {
         if (*v != '\0')
@@ -976,6 +979,7 @@ static bool simplegc_init_heap()
             uint64_t mb = std::strtoull(v, nullptr, 10);
             g_autoCollectThresholdBytes.store(mb * 1024ULL * 1024ULL,
                                               std::memory_order_release);
+            autoCollectUserSet = true;
             LOG1("SIMPLEGC_AUTO_COLLECT_MB=%llu", (unsigned long long)mb);
         }
     }
@@ -984,6 +988,7 @@ static bool simplegc_init_heap()
         if (std::strcmp(v, "marksweep") == 0 || std::strcmp(v, "ms") == 0)
         {
             g_defaultRoute.store(kRouteMarkSweep, std::memory_order_release);
+            defaultRouteUserSet = true;
             LOG1("SIMPLEGC_DEFAULT_ROUTE=marksweep");
         }
     }
@@ -1014,8 +1019,80 @@ static bool simplegc_init_heap()
             if (kb <= 16384)  // cap at 16 MB
             {
                 kSubArenaSize = (size_t)(kb * 1024);
+                subArenaUserSet = true;
                 LOG1("SIMPLEGC_SUB_ARENA_KB=%llu (kSubArenaSize=%zu bytes)",
                      (unsigned long long)kb, kSubArenaSize);
+            }
+        }
+    }
+    // ---- M1m.1: cap-aware auto-tune from DOTNET_GCHeapHardLimit ----
+    // When the runtime is configured with a hard heap-size limit (typical
+    // for containers), auto-engage the policy-mode defaults so plain
+    // simplegc users get sensible behavior under tight caps without
+    // setting SIMPLEGC_* env vars manually.
+    //
+    //  cap > 384 MB: keep sub-arenas on (256 KB), default route stays
+    //                perm (uncollectible bump arena handles loose caps
+    //                with no collection at all when total allocs fit).
+    //  cap <= 384 MB: switch to MS default route + auto-collect threshold
+    //                = cap/8 (e.g. 256 MB cap -> 32 MB threshold,
+    //                140 MB cap -> 17 MB). Disable sub-arenas (which
+    //                over-commit MS at tight caps - see M1m regression).
+    //
+    // User SIMPLEGC_* settings always win; this only fills in defaults.
+    uint64_t hardLimitBytes = 0;
+    if (const char* v = std::getenv("DOTNET_GCHeapHardLimit"))
+    {
+        if (*v != '\0')
+        {
+            // Hex (0x prefix) per CLR convention.
+            hardLimitBytes = std::strtoull(v, nullptr, 0);
+        }
+    }
+    if (hardLimitBytes > 0)
+    {
+        size_t hardLimitMb = (size_t)(hardLimitBytes >> 20);
+        LOG1("DOTNET_GCHeapHardLimit=%zu MB detected; auto-tuning defaults", hardLimitMb);
+        bool tightCap = (hardLimitMb <= 384);
+        if (tightCap)
+        {
+            if (!defaultRouteUserSet)
+            {
+                g_defaultRoute.store(kRouteMarkSweep, std::memory_order_release);
+                LOG1("  auto-tune: default_route=marksweep (tight cap)");
+            }
+            if (!autoCollectUserSet)
+            {
+                size_t thresholdMb = hardLimitMb / 8;
+                if (thresholdMb < 8) thresholdMb = 8;
+                g_autoCollectThresholdBytes.store(
+                    (uint64_t)thresholdMb * 1024ULL * 1024ULL,
+                    std::memory_order_release);
+                LOG1("  auto-tune: auto_collect_mb=%zu (cap/8)", thresholdMb);
+            }
+            if (!subArenaUserSet)
+            {
+                kSubArenaSize = 0;
+                LOG1("  auto-tune: sub_arena_kb=0 (tight cap)");
+            }
+        }
+        else
+        {
+            // Loose cap: still engage MS+auto-collect so plain simplegc
+            // doesn't OOM on continuous workloads, but keep sub-arenas
+            // for throughput.
+            if (!defaultRouteUserSet)
+            {
+                g_defaultRoute.store(kRouteMarkSweep, std::memory_order_release);
+                LOG1("  auto-tune: default_route=marksweep (loose cap)");
+            }
+            if (!autoCollectUserSet)
+            {
+                size_t thresholdMb = hardLimitMb / 8;
+                g_autoCollectThresholdBytes.store(
+                    (uint64_t)thresholdMb * 1024ULL * 1024ULL,
+                    std::memory_order_release);
+                LOG1("  auto-tune: auto_collect_mb=%zu (cap/8)", thresholdMb);
             }
         }
     }
