@@ -335,6 +335,33 @@ namespace
     constexpr uint32_t kStrategyAbiVersion = 1;
     constexpr uint64_t kConsultThreshold   = 256 * 1024; // 256 KB
 
+    // ---- M1j.3: cap-aware auto-collect (env-driven) ------------------------
+    //
+    // When SIMPLEGC_AUTO_COLLECT_MB=N is set, simplegc::Alloc's slow path
+    // checks (perm.committed - perm.start) + (marksweep.committed -
+    // marksweep.start) and triggers simplegc_force_collect() when this
+    // exceeds N MB. Throttled by g_autoCollectThrottleBytes so we don't
+    // collect on every slow-path call once we're over the threshold.
+    //
+    // 0 = disabled (default; preserves the previous "never auto-collect"
+    // behavior). Set at init from the env var; never changes thereafter.
+    std::atomic<uint64_t> g_autoCollectThresholdBytes{0};
+    std::atomic<uint64_t> g_bytesAtLastAutoCollect{0};
+    std::atomic<uint64_t> g_autoCollectCount{0};
+    constexpr uint64_t kAutoCollectThrottleBytes = 16 * 1024 * 1024; // 16 MB
+
+    // Single-collection-at-a-time gate. Replaces the `g_marksweep.lock`
+    // bracket previously used at the top of simplegc_force_collect.
+    //
+    // We can NOT hold a native mutex across SuspendEE: other threads that
+    // are inside the Alloc slow path may already be blocked on
+    // g_marksweep.lock while running native code (no safe-point), so
+    // SuspendEE would deadlock waiting for them. An atomic flag gates
+    // entry without blocking. Threads that lose the race simply return —
+    // either someone else is collecting now, or they retry on the next
+    // slow-path crossing of the threshold.
+    std::atomic<bool> g_collectInProgress{false};
+
     // ---- M1a: per-MethodTable allocation counters --------------------------
     //
     // Open-addressed lock-free hash table keyed by MethodTable*. Every chunk
@@ -854,6 +881,35 @@ static bool simplegc_init_heap()
 
     LOG1("heap reserved at %p .. %p (perm=%zu MB, request=%zu MB, marksweep=%zu MB, norefsperm=%zu MB)",
          g_heapStart, g_heapEnd, kPermSize >> 20, kRequestSize >> 20, kMarkSweepSize >> 20, kNoRefsPermSize >> 20);
+
+    // ---- M1j.3: env-driven cap-aware policy ----
+    // SIMPLEGC_AUTO_COLLECT_MB=N
+    //   When perm+ms committed bytes exceed N MB, force_collect is
+    //   triggered from the Alloc slow path. 0 disables. Recommended:
+    //   set to 60-70% of the process memory cap for headroom.
+    // SIMPLEGC_DEFAULT_ROUTE=marksweep
+    //   Set the global default route to MS. Allocations that would
+    //   otherwise default to perm get routed to the collectible MS
+    //   region instead. Without this, auto-collect has no work to do
+    //   because everything sits in (uncollectible) perm.
+    if (const char* v = std::getenv("SIMPLEGC_AUTO_COLLECT_MB"))
+    {
+        if (*v != '\0')
+        {
+            uint64_t mb = std::strtoull(v, nullptr, 10);
+            g_autoCollectThresholdBytes.store(mb * 1024ULL * 1024ULL,
+                                              std::memory_order_release);
+            LOG1("SIMPLEGC_AUTO_COLLECT_MB=%llu", (unsigned long long)mb);
+        }
+    }
+    if (const char* v = std::getenv("SIMPLEGC_DEFAULT_ROUTE"))
+    {
+        if (std::strcmp(v, "marksweep") == 0 || std::strcmp(v, "ms") == 0)
+        {
+            g_defaultRoute.store(kRouteMarkSweep, std::memory_order_release);
+            LOG1("SIMPLEGC_DEFAULT_ROUTE=marksweep");
+        }
+    }
     return true;
 }
 
@@ -2019,6 +2075,48 @@ public:
             }
         }
 
+        // ---- M1j.3: cap-aware auto-collect ----
+        //
+        // When SIMPLEGC_AUTO_COLLECT_MB=N is set at init, force_collect
+        // is triggered from here once mark-sweep committed bytes cross
+        // the threshold. Throttled by kAutoCollectThrottleBytes so we
+        // don't hammer collect on every slow-path call once we're over.
+        //
+        // Mark-sweep is the only region that gets collected — perm and
+        // norefsPerm grow forever; request rewinds via app brackets. So
+        // we threshold on MS committed bytes specifically. Pair this
+        // with SIMPLEGC_DEFAULT_ROUTE=marksweep so allocations actually
+        // land in the collectible region.
+        //
+        // Re-uses s_inConsult as a re-entrancy guard so a callback into
+        // managed code triggered by force_collect (e.g. via root scan)
+        // doesn't recursively trigger another collect.
+        //
+        // Locks: NONE held at this point. Safe to run force_collect (it
+        // takes g_marksweep.lock and SuspendEE-s internally).
+        uint64_t threshold = g_autoCollectThresholdBytes.load(std::memory_order_relaxed);
+        if (threshold != 0 && !s_inConsult && g_marksweep.start_obj != nullptr)
+        {
+            uint64_t msCommitted =
+                static_cast<uint64_t>(g_marksweep.committed - g_marksweep.start_obj);
+            if (msCommitted >= threshold)
+            {
+                uint64_t total    = g_marksweep.bytes_allocated.load(std::memory_order_relaxed);
+                uint64_t lastAuto = g_bytesAtLastAutoCollect.load(std::memory_order_relaxed);
+                if (total >= lastAuto + kAutoCollectThrottleBytes &&
+                    g_bytesAtLastAutoCollect.compare_exchange_strong(lastAuto, total))
+                {
+                    s_inConsult = true;
+                    LOG1("auto-collect: msCommitted=%zu MB threshold=%zu MB",
+                         (size_t)(msCommitted >> 20), (size_t)(threshold >> 20));
+                    g_gcCount.fetch_add(1, std::memory_order_relaxed);
+                    simplegc_force_collect();
+                    g_autoCollectCount.fetch_add(1, std::memory_order_relaxed);
+                    s_inConsult = false;
+                }
+            }
+        }
+
         // Refill the alloc context with a fresh chunk and place this object inside.
         // The runtime fast-path will then bump-allocate from the context until it's
         // exhausted again.
@@ -2334,12 +2432,24 @@ HRESULT simplegc_force_collect()
     if (g_simpleHeap == nullptr) return S_OK;
     if (g_marksweep.start_obj == nullptr) return S_OK;
 
+    // Single-collect gate. We can NOT use std::mutex here because we
+    // need to call SuspendEE without holding any native lock — see
+    // g_collectInProgress declaration for rationale.
+    bool expected = false;
+    if (!g_collectInProgress.compare_exchange_strong(expected, true,
+                                                     std::memory_order_acquire))
     {
-        // Bracket: only one collection at a time.
-        std::lock_guard<std::mutex> guard(g_marksweep.lock);
+        // Another thread is already collecting; skip this round. The
+        // next allocation that crosses the throttle will retry.
+        return S_OK;
+    }
 
+    {
         // Suspend the EE so we can scan stacks safely. The runtime guarantees
-        // every thread is at a safe point on return.
+        // every thread is at a safe point on return. Once suspended, no
+        // managed code is running — so g_marksweep allocator state is
+        // implicitly serialized for the duration of the collect; no mutex
+        // needed.
         GCToEEInterface::SuspendEE(SUSPEND_FOR_GC);
 
         // M1e: encode every cached chunk's abandoned tail as a free-object
@@ -2427,7 +2537,10 @@ HRESULT simplegc_force_collect()
         }
 
         GCToEEInterface::RestartEE(/*bFinishedGC*/ true);
-    }   // <-- release g_marksweep.lock BEFORE invoking the managed callback.
+    }   // <-- scope-end (was: release g_marksweep.lock here).
+
+    // Release the single-collect gate now that EE has restarted.
+    g_collectInProgress.store(false, std::memory_order_release);
 
     // Invoke the registered routing-policy callback (if any). Runs OUTSIDE
     // both the suspended-EE bracket AND the marksweep lock — so the

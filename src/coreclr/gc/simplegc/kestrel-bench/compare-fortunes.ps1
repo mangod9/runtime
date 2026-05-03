@@ -20,13 +20,19 @@
 
 [CmdletBinding()]
 param(
-    [string[]] $Modes    = @('default', 'simplegc'),
+    [string[]] $Modes    = @('default', 'simplegc', 'simplegc-policy'),
     [long[]]   $CapsMb   = @(0, 1024, 512),
     [int]      $C        = 8,
     [int]      $N        = 10000,
     [string]   $Endpoint = 'fortunes',
     [string]   $BenchExe = (Join-Path $PSScriptRoot 'bin\Release\net10.0\kestrel-bench.exe'),
-    [int]      $WarmupSeconds = 0
+    [int]      $WarmupSeconds = 0,
+    # simplegc-policy mode tuning. AutoCollectMb is the MS committed-bytes
+    # threshold at which the substrate auto-fires a force_collect. The
+    # default of 64 MB is a generic value; for tight caps you may want
+    # (cap * 0.4) or so to give headroom for non-MS commits (perm, JIT,
+    # loaded modules, OS overhead).
+    [int]      $AutoCollectMb = 64
 )
 
 $ErrorActionPreference = 'Stop'
@@ -109,14 +115,29 @@ function Run-One {
         # set it for parity with M1j.2 reproducer but it is now a no-op
         # in the kestrel-bench binary.
     }
+    elseif ($Mode -eq 'simplegc-policy') {
+        # M1j.3: cap-aware policy mode. SIMPLEGC_DEFAULT_ROUTE=marksweep
+        # routes default allocations into the collectible mark-sweep
+        # region, and SIMPLEGC_AUTO_COLLECT_MB triggers force_collect()
+        # from the slow path once MS committed bytes cross the
+        # threshold. Without these, plain simplegc grows unbounded
+        # because nothing in the kestrel-bench binary calls
+        # GC.Collect() or any explicit collect trigger.
+        $envBlock['DOTNET_GCName']           = 'simplegc.dll'
+        $envBlock['DOTNET_StandaloneGCName'] = 'simplegc.dll'
+        $envBlock['SIMPLEGC_DEFAULT_ROUTE']  = 'marksweep'
+        $envBlock['SIMPLEGC_AUTO_COLLECT_MB'] = "$AutoCollectMb"
+    }
     # else 'default': leave env empty so runtime uses regular GC.
 
     $args = @('--ep', $Endpoint, '--c', $C, '--n', $N)
     if ($CapMb -gt 0) { $args += @('--mem-mb', $CapMb) }
 
     # Apply env, run, capture, restore. Snapshot prior values for restore.
+    $envKeys = @('DOTNET_GCName','DOTNET_StandaloneGCName',
+                 'SIMPLEGC_DEFAULT_ROUTE','SIMPLEGC_AUTO_COLLECT_MB')
     $prior = @{}
-    foreach ($k in @('DOTNET_GCName','DOTNET_StandaloneGCName')) {
+    foreach ($k in $envKeys) {
         $prior[$k] = [Environment]::GetEnvironmentVariable($k)
     }
     foreach ($kv in $envBlock.GetEnumerator()) {
@@ -143,7 +164,7 @@ function Run-One {
     finally {
         $sw.Stop()
         # Restore env
-        foreach ($k in @('DOTNET_GCName','DOTNET_StandaloneGCName')) {
+        foreach ($k in $envKeys) {
             [Environment]::SetEnvironmentVariable($k, $prior[$k])
         }
     }
@@ -200,7 +221,7 @@ Write-Host ""
 
 $results = New-Object System.Collections.Generic.List[object]
 foreach ($mode in $Modes) {
-    if ($mode -eq 'simplegc' -and -not $simplegcAvailable) {
+    if ($mode -like 'simplegc*' -and -not $simplegcAvailable) {
         Write-Warning "Skipping mode '$mode' — simplegc.dll missing."
         continue
     }
