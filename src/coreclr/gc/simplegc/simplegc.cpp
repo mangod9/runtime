@@ -1138,6 +1138,18 @@ static bool simplegc_init_heap()
             }
         }
     }
+    // Last-resort default: if neither user nor cap-aware auto-tune set
+    // an auto-collect threshold, the policy mode would leak forever.
+    // Pick 128 MB — matches the empirical sweet spot at common caps and
+    // is large enough that uncapped throughput-bound workloads don't
+    // collect too often.
+    if (g_autoCollectThresholdBytes.load(std::memory_order_relaxed) == 0
+        && g_defaultRoute.load(std::memory_order_relaxed) == kRouteMarkSweep)
+    {
+        g_autoCollectThresholdBytes.store(128ULL * 1024ULL * 1024ULL,
+                                          std::memory_order_release);
+        LOG1("auto-tune: auto_collect_mb=128 (uncapped fallback default)");
+    }
     return true;
 }
 

@@ -28,11 +28,14 @@ param(
     [string]   $BenchExe = (Join-Path $PSScriptRoot 'bin\Release\net10.0\kestrel-bench.exe'),
     [int]      $WarmupSeconds = 0,
     # simplegc-policy mode tuning. AutoCollectMb is the MS committed-bytes
-    # threshold at which the substrate auto-fires a force_collect. The
-    # default of 64 MB is a generic value; for tight caps you may want
-    # (cap * 0.4) or so to give headroom for non-MS commits (perm, JIT,
-    # loaded modules, OS overhead).
-    [int]      $AutoCollectMb = 64,
+    # threshold at which the substrate auto-fires a force_collect.
+    #
+    # Default -1 = "let the substrate auto-tune from DOTNET_GCHeapHardLimit"
+    # (cap/8: e.g. 128 MB at 1024 cap; 32 MB at 256; 17 MB at 140 cap).
+    # That value matches what we found best empirically (M1m.2 sweep at
+    # 1024 cap: 64=11k, 96=19k, 128=23k, 192=21k rps). Override only if
+    # diagnosing the substrate's auto-tune.
+    [int]      $AutoCollectMb = -1,
     # M1m: per-thread MS sub-arena size in KB (TLAB of chunks). 256 KB is
     # the substrate default; lifts the chunk-allocator lock contention
     # ceiling at loose caps. At tight caps (<=256 MB), 16 threads × 256 KB
@@ -136,7 +139,11 @@ function Run-One {
         $envBlock['DOTNET_GCName']           = 'simplegc.dll'
         $envBlock['DOTNET_StandaloneGCName'] = 'simplegc.dll'
         $envBlock['SIMPLEGC_DEFAULT_ROUTE']  = 'marksweep'
-        $envBlock['SIMPLEGC_AUTO_COLLECT_MB'] = "$AutoCollectMb"
+        # AutoCollectMb=-1 -> defer to substrate auto-tune (M1m.1) which
+        # picks cap/8 from DOTNET_GCHeapHardLimit.
+        if ($AutoCollectMb -ge 0) {
+            $envBlock['SIMPLEGC_AUTO_COLLECT_MB'] = "$AutoCollectMb"
+        }
         $envBlock['SIMPLEGC_SUB_ARENA_KB']   = "$SubArenaKbResolved"
     }
     # else 'default': leave env empty so runtime uses regular GC.
