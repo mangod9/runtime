@@ -49,6 +49,7 @@ internal enum Workload
     Current,
     Scope,
     Cache,
+    Grow,
 }
 
 internal static class Program
@@ -79,6 +80,7 @@ internal static class Program
             if (a == "--workload=current") return Workload.Current;
             if (a == "--workload=scope")   return Workload.Scope;
             if (a == "--workload=cache")   return Workload.Cache;
+            if (a == "--workload=grow")    return Workload.Grow;
         }
 
         return Workload.Current;
@@ -97,6 +99,7 @@ internal static class Program
             Workload.Current => RunCurrentWorkload(mode, usePolicy, useSimplegc),
             Workload.Scope   => RunScopedWorkload (mode, usePolicy, useSimplegc),
             Workload.Cache   => RunCacheWorkload  (mode, usePolicy, useSimplegc),
+            Workload.Grow    => RunGrowWorkload   (mode, usePolicy, useSimplegc),
             _ => 1,
         };
     }
@@ -769,6 +772,233 @@ internal static class Program
         Console.WriteLine($"XGC sink                 = {sink}");
 
         GC.KeepAlive(cache);
+        return 0;
+    }
+
+    // ====================================================================
+    // M1f-d workload: growing long-lived heap (showcases POLICY value).
+    //
+    // The "grow" workload extends the M1d "current" workload to a scale
+    // where the cost of tracing a large mark-sweep heap dominates, so
+    // that simplegc-policy (which promotes long-lived MTs to perm) pulls
+    // away from simplegc-nopolicy (which never promotes).
+    //
+    // Per-cycle pattern:
+    //   - Allocate <GrowTransientPerCycle> short-lived TransientItems.
+    //   - Allocate <GrowLongLivedPerCycle> long-lived LongLivedItems and
+    //     store them in roots[]. They survive forever.
+    //   - Run a mark-sweep collect (simplegc) or let default GC manage.
+    //
+    // simplegc-nopolicy: every long-lived item lands in the MS region.
+    //   By cycle 100, MS holds 50,000 LongLivedItems (~7 MB). Each
+    //   collect's mark phase has to trace all of them.
+    //
+    // simplegc-policy: BasicPolicy observes LongLivedItem survives every
+    //   collection. After AgeThreshold (default 2) collections the policy
+    //   promotes future LongLivedItem allocations to ForcePerm. From
+    //   cycle ~5 onward, new long-lived items go to perm. MS only ever
+    //   contains the early ~1000 items + transient churn, so collect
+    //   cost stops growing.
+    //
+    // default GC: long-lived items naturally promote to gen2; periodic
+    //   gen2 collections trace the entire promoted heap.
+    //
+    // The win condition: simplegc-policy beats simplegc-nopolicy by
+    //   a wide margin AND is competitive with (or beats) default GC.
+    // ====================================================================
+
+    private const int GrowWarmupCycles      = 5;
+    private const int GrowMeasurementCycles = 200;
+    private const int GrowLongLivedPerCycle = 500;
+    private const int GrowTransientPerCycle = 20_000;
+
+    // Static sink to keep TransientItem allocations from being eliminated
+    // by JIT escape analysis once the workload loop tiers up.
+    private static volatile TransientItem? s_transientSink;
+
+    private static int RunGrowWorkload(GcMode mode, bool usePolicy, bool useSimplegc)
+    {
+        Console.WriteLine($"# grow workload: cycles={GrowMeasurementCycles}+{GrowWarmupCycles} warmup, longlived/cycle={GrowLongLivedPerCycle}, transient/cycle={GrowTransientPerCycle}");
+
+        if (useSimplegc)
+        {
+            SimpleGCInterop.SetDefaultRoute((int)Route.MarkSweep);
+            SimpleGCInterop.EnableMtTracking(1);
+        }
+
+        int rootCapacity = GrowLongLivedPerCycle * (GrowWarmupCycles + GrowMeasurementCycles);
+        var roots = new LongLivedItem?[rootCapacity];
+        int rootCursor = 0;
+
+        PolicyHost? host = null;
+        if (useSimplegc)
+        {
+            IPolicy policy = usePolicy
+                ? new BasicPolicy { PromoteTo = Route.ForcePerm }
+                : new PassivePolicy();
+            host = PolicyHost.Start(policy);
+            Console.WriteLine($"# grow workload: {policy.GetType().Name} started");
+        }
+
+        // ---- Cross-GC metric setup ----
+        var process = Process.GetCurrentProcess();
+        long crossWallStartTicks = Stopwatch.GetTimestamp();
+        long crossAllocStart     = SafeTotalAllocatedBytes();
+        int  crossGen0Start      = GC.CollectionCount(0);
+        int  crossGen1Start      = GC.CollectionCount(1);
+        int  crossGen2Start      = GC.CollectionCount(2);
+        TimeSpan crossPauseStart = SafeTotalPauseDuration();
+        long crossPeakWss        = 0;
+        long crossPeakManaged    = 0;
+        long crossSimplegcCollectUsSum = 0;
+        long firstMeasureCollectUs     = -1;
+        long lastMeasureCollectUs      = -1;
+        int  promotionCycle            = -1;  // when did policy promote LongLivedItem?
+
+        double tickToUs = 1_000_000.0 / Stopwatch.Frequency;
+
+        Console.WriteLine("phase,cycle,collect_us,managed_kb,wss_kb,longlived_route");
+
+        int totalCycles = GrowWarmupCycles + GrowMeasurementCycles;
+        for (int cycle = 0; cycle < totalCycles; cycle++)
+        {
+            bool warmup = cycle < GrowWarmupCycles;
+            int  measureCycle = cycle - GrowWarmupCycles;
+
+            // Prefetch the policy's recommendation once per cycle.
+            Route longLivedRoute = host?.GetRouteFor<LongLivedItem>() ?? Route.Default;
+            if (longLivedRoute != Route.Default && promotionCycle < 0)
+            {
+                promotionCycle = cycle;
+                Console.WriteLine($"# policy promoted LongLivedItem -> {longLivedRoute} at cycle {cycle}");
+            }
+
+            // Transient churn (default route = MS arena for simplegc, gen0
+            // for default GC). The static sink ensures the JIT can't elide
+            // the allocation on tiered-compiled hot paths.
+            TransientItem? sink = null;
+            for (int i = 0; i < GrowTransientPerCycle; i++)
+            {
+                sink = new TransientItem(i, i + 1, i + 2);
+            }
+            s_transientSink = sink;
+
+            // Long-lived: bracket with the policy's route hint when present.
+            int savedRoute = (int)Route.Default;
+            if (useSimplegc && longLivedRoute != Route.Default)
+            {
+                savedRoute = SimpleGCInterop.GetThreadRoute();
+                SimpleGCInterop.SetThreadRoute((int)longLivedRoute);
+            }
+            for (int i = 0; i < GrowLongLivedPerCycle && rootCursor < roots.Length; i++)
+            {
+                roots[rootCursor++] = new LongLivedItem(cycle, i, rootCursor);
+            }
+            if (useSimplegc && longLivedRoute != Route.Default)
+            {
+                SimpleGCInterop.SetThreadRoute(savedRoute);
+            }
+
+            // Per-cycle collect (simplegc only — default GC manages itself).
+            long collectUs = 0;
+            if (useSimplegc)
+            {
+                long collectStart = Stopwatch.GetTimestamp();
+                int rc = SimpleGCInterop.CollectMarkSweep();
+                long collectEnd = Stopwatch.GetTimestamp();
+                collectUs = (long)((collectEnd - collectStart) * tickToUs);
+                if (rc < 0)
+                {
+                    Console.Error.WriteLine($"# CollectMarkSweep failed: {rc}");
+                    return 2;
+                }
+                if (!warmup)
+                {
+                    crossSimplegcCollectUsSum += collectUs;
+                    if (firstMeasureCollectUs < 0) firstMeasureCollectUs = collectUs;
+                    lastMeasureCollectUs = collectUs;
+                }
+            }
+
+            // Sample WSS / managed every 20 cycles.
+            if (cycle % 20 == 0 || cycle == totalCycles - 1)
+            {
+                process.Refresh();
+                long curWss     = process.WorkingSet64;
+                long curManaged = GC.GetTotalMemory(forceFullCollection: false);
+                if (curWss     > crossPeakWss)     crossPeakWss     = curWss;
+                if (curManaged > crossPeakManaged) crossPeakManaged = curManaged;
+                string phase = warmup ? "warmup" : "measure";
+                Console.WriteLine(string.Format(CultureInfo.InvariantCulture,
+                    "{0,7},{1,5},{2,11},{3,10},{4,10},{5}",
+                    phase, cycle, collectUs,
+                    curManaged / 1024, curWss / 1024, longLivedRoute));
+            }
+        }
+
+        // ---- End-of-run cross-GC summary ----
+        long crossWallEndTicks = Stopwatch.GetTimestamp();
+        long wallTotalMs = (long)((crossWallEndTicks - crossWallStartTicks) * 1000.0
+                                  / Stopwatch.Frequency);
+        long allocTotalBytes = SafeTotalAllocatedBytes() - crossAllocStart;
+        int gen0Total = GC.CollectionCount(0) - crossGen0Start;
+        int gen1Total = GC.CollectionCount(1) - crossGen1Start;
+        int gen2Total = GC.CollectionCount(2) - crossGen2Start;
+        TimeSpan crossPauseEnd = SafeTotalPauseDuration();
+        TimeSpan defaultPauseTotal = crossPauseEnd - crossPauseStart;
+
+        process.Refresh();
+        crossPeakWss     = Math.Max(crossPeakWss,     process.WorkingSet64);
+        crossPeakManaged = Math.Max(crossPeakManaged, GC.GetTotalMemory(false));
+
+        string xgcMode = mode switch
+        {
+            GcMode.SimplegcPolicy   => "simplegc-policy",
+            GcMode.SimplegcNoPolicy => "simplegc-nopolicy",
+            _                       => "default",
+        };
+        long pauseTotalMs = useSimplegc
+            ? crossSimplegcCollectUsSum / 1000
+            : (long)defaultPauseTotal.TotalMilliseconds;
+        string pauseSource = useSimplegc
+            ? "simplegc-collect-marksweep-sum"
+            : "GC.GetTotalPauseDuration";
+
+        // Non-null roots[] entries — correctness check.
+        int retained = 0;
+        for (int i = 0; i < roots.Length; i++)
+        {
+            if (roots[i] is not null) retained++;
+        }
+
+        Console.WriteLine();
+        Console.WriteLine("# === Cross-GC summary (M1f-d grow workload) ===");
+        Console.WriteLine($"XGC mode                 = {xgcMode}");
+        Console.WriteLine($"XGC workload             = grow");
+        Console.WriteLine($"XGC cycles               = {GrowMeasurementCycles} (+{GrowWarmupCycles} warmup)");
+        Console.WriteLine($"XGC longlived_per_cycle  = {GrowLongLivedPerCycle}");
+        Console.WriteLine($"XGC transient_per_cycle  = {GrowTransientPerCycle}");
+        Console.WriteLine($"XGC wall_clock_ms        = {wallTotalMs}");
+        Console.WriteLine(string.Format(CultureInfo.InvariantCulture,
+            "XGC total_alloc_mb       = {0:F3}", allocTotalBytes / 1024.0 / 1024.0));
+        Console.WriteLine(string.Format(CultureInfo.InvariantCulture,
+            "XGC peak_wss_mb          = {0:F3}", crossPeakWss / 1024.0 / 1024.0));
+        Console.WriteLine(string.Format(CultureInfo.InvariantCulture,
+            "XGC peak_managed_mb      = {0:F3}", crossPeakManaged / 1024.0 / 1024.0));
+        Console.WriteLine($"XGC gen0_count           = {gen0Total}");
+        Console.WriteLine($"XGC gen1_count           = {gen1Total}");
+        Console.WriteLine($"XGC gen2_count           = {gen2Total}");
+        Console.WriteLine($"XGC pause_total_ms       = {pauseTotalMs}    # source: {pauseSource}");
+        if (useSimplegc)
+        {
+            Console.WriteLine($"XGC first_collect_us     = {firstMeasureCollectUs}");
+            Console.WriteLine($"XGC last_collect_us      = {lastMeasureCollectUs}");
+            Console.WriteLine($"XGC promotion_cycle      = {promotionCycle}    # -1 means policy never promoted");
+        }
+        Console.WriteLine($"XGC retained             = {retained}/{rootCapacity}");
+
+        host?.Dispose();
+        GC.KeepAlive(roots);
         return 0;
     }
 }

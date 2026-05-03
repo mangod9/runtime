@@ -935,22 +935,34 @@ static void ms_freelist_push(uint8_t* p, size_t size)
 // returned slot is removed from the freelist and zeroed. If the slot is
 // larger than needed and the remainder is >= ms_free_object_min_size(), the
 // remainder is re-linked as a smaller free object.
+//
+// **Soundness rule**: we MUST NOT hand back a slot whose remainder is
+// non-zero but too small to hold a free filler header. The linear walker
+// (ms_build_object_start_index, ms_sweep_locked) advances by the alloc'd
+// object's size, lands in the unfilled "slop", reads MT=0, and `break`s —
+// silently truncating the rest of the arena from the index. We avoid that
+// by skipping any slot where `remainder` would be in (0, min_size).
 static uint8_t* ms_freelist_take(size_t size)
 {
+    const size_t minFreeSize = ms_free_object_min_size();
     uint8_t** slot = &g_marksweep.free_head;
     while (*slot != nullptr)
     {
         uint8_t* p = *slot;
         size_t s = ms_read_free_obj_size(p);
-        if (s >= size)
+        // Accept slots that fit exactly OR leave a fillable remainder.
+        // Reject slots that would create unfillable slop.
+        bool exactFit  = (s == size);
+        bool clean_split = (s >= size + minFreeSize);
+        if (exactFit || clean_split)
         {
             // Unlink.
             *slot = ms_freelist_next(p);
             g_marksweep.bytes_freelist.fetch_sub(s, std::memory_order_relaxed);
 
-            size_t remainder = s - size;
-            if (remainder >= ms_free_object_min_size())
+            if (clean_split)
             {
+                size_t remainder = s - size;
                 uint8_t* tail = p + size;
                 ms_set_free_obj(tail, remainder);
                 if (remainder >= 24)
@@ -1268,14 +1280,19 @@ namespace
         g_msStartsCache.clear();
         uint8_t* p   = g_marksweep.start_obj;
         uint8_t* end = g_marksweep.bump;
+        size_t walked = 0;
+        size_t freeFillers = 0;
+        const char* stopReason = "reached_end";
+        uint8_t* lastP = p;
         while (p < end)
         {
             MethodTable* mt = *reinterpret_cast<MethodTable**>(p);
-            if (mt == nullptr) break;
+            if (mt == nullptr) { stopReason = "mt_null"; lastP = p; break; }
             uint32_t size;
             if (mt == g_gc_pFreeObjectMethodTable)
             {
                 size = (uint32_t)ms_read_free_obj_size(p);
+                ++freeFillers;
             }
             else
             {
@@ -1284,12 +1301,14 @@ namespace
                 // (no point marking a free object).
                 g_msStartsCache.push_back(p);
             }
-            if (size < sizeof(void*) || p + size > end) break;
+            if (size < sizeof(void*) || p + size > end) { stopReason = "bad_size"; lastP = p; break; }
             p += size;
+            ++walked;
         }
         // Already sorted by construction (linear scan from low to high).
-        LOG1("ms_build_object_start_index: %zu MS objects indexed",
-             g_msStartsCache.size());
+        LOG1("ms_build_object_start_index: %zu MS objects indexed (walked=%zu fillers=%zu stop=%s lastP=%p arena=[%p..%p))",
+             g_msStartsCache.size(), walked, freeFillers, stopReason, lastP,
+             g_marksweep.start_obj, g_marksweep.bump);
     }
 
     static inline bool ms_is_object_start(uint8_t* candidate)
