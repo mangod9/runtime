@@ -1938,6 +1938,22 @@ public:
     // ---- Allocation ----------------------------------------------------
     Object* Alloc(gc_alloc_context* acontext, size_t size, uint32_t flags) override
     {
+        // ---- M1i.2: align size to 8 BEFORE any other work ----
+        // The runtime's gchelpers slow path passes the *raw* object size to
+        // IGCHeap::Alloc (e.g. for byte[29], size = 24 + 29 = 53). The default
+        // GC aligns it internally (gc_heap::allocate, allocation.cpp:4557).
+        // We must do the same — otherwise the bump path's
+        //   acontext->alloc_ptr = chunk + size
+        // produces a non-8-aligned alloc_ptr, and every subsequent fast-path
+        // allocation from that chunk is misaligned. That breaks any code that
+        // assumes 8-aligned objects, including SSE2/AVX vmovdqa moves emitted
+        // for things like Latin1Utility.WidenLatin1ToUtf16_Sse2.
+        //
+        // The mark-sweep path below already aligns separately; aligning here
+        // is harmless for it (alignedSize = (size + 7) & ~7 idempotent on an
+        // already-aligned size).
+        size = (size + 7u) & ~static_cast<size_t>(7);
+
         // ---- M1a: attribute the chunk we're about to abandon ----
         // The previous chunk (if any) has been bump-filled by fast path; its
         // objects' MTs are now written. Walk and bin them before we refill.
