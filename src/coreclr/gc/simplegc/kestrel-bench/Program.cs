@@ -800,6 +800,11 @@ internal static class Driver
         Console.WriteLine($"  gen0     : {GC.CollectionCount(0)}");
         Console.WriteLine($"  gen1     : {GC.CollectionCount(1)}");
         Console.WriteLine($"  gen2     : {GC.CollectionCount(2)}");
+        // Total time the runtime was paused for GC (since process start). For
+        // standalone GCs this returns Zero because the runtime doesn't track
+        // pauses there — simplegc reports its own pause time via LOG1
+        // "phase_us total=...". Default GC reports a real number here.
+        Console.WriteLine($"  pauseDur : {GC.GetTotalPauseDuration().TotalMilliseconds,10:F1} ms");
         var p = Process.GetCurrentProcess();
         p.Refresh();
         Console.WriteLine($"  workSet  : {p.WorkingSet64 / 1024.0 / 1024.0,10:F1} MB");

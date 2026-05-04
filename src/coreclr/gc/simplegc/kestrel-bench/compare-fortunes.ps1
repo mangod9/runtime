@@ -128,6 +128,15 @@ function Run-One {
         # set it for parity with M1j.2 reproducer but it is now a no-op
         # in the kestrel-bench binary.
     }
+    elseif ($Mode -eq 'default-server') {
+        # Override the csproj's <ServerGarbageCollection>false</> at startup
+        # via env. Lets us A/B test "csproj is honored (=> WKS)" vs Server
+        # GC on the same binary. DOTNET_gcServer=1 forces Server GC,
+        # DOTNET_gcConcurrent=0 keeps non-concurrent so the comparison is
+        # apples-to-apples against simpleGC's STW model.
+        $envBlock['DOTNET_gcServer']     = '1'
+        $envBlock['DOTNET_gcConcurrent'] = '0'
+    }
     elseif ($Mode -eq 'simplegc-policy') {
         # M1j.3: cap-aware policy mode. SIMPLEGC_DEFAULT_ROUTE=marksweep
         # routes default allocations into the collectible mark-sweep
@@ -163,6 +172,7 @@ function Run-One {
     # Apply env, run, capture, restore. Snapshot prior values for restore.
     $envKeys = @('DOTNET_GCName','DOTNET_StandaloneGCName',
                  'DOTNET_GCHeapHardLimit',
+                 'DOTNET_gcServer','DOTNET_gcConcurrent',
                  'SIMPLEGC_DEFAULT_ROUTE','SIMPLEGC_AUTO_COLLECT_MB',
                  'SIMPLEGC_SUB_ARENA_KB')
     $prior = @{}
