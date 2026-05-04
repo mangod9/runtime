@@ -1085,6 +1085,41 @@ internal static class Driver
             {
                 Console.WriteLine($"  promotedMTs: {promotedMts} (auto-promoted to perm by SIMPLEGC_PROMOTE_AFTER_N_ALLOC)");
             }
+
+            // M1r.2: smoke-test the new substrate-context ABI surface so we
+            // can see it works end-to-end before the M1r.3 budget-aware
+            // policy starts using it for real decisions.
+            unsafe
+            {
+                MemoryPressure mp = default;
+                LastCollect    lc = default;
+                uint mpV = SimpleGCInterop.GetMemoryPressure(&mp);
+                uint lcV = SimpleGCInterop.GetLastCollect(&lc);
+                if (mpV == MemoryPressure.SupportedAbiVersion)
+                {
+                    Console.WriteLine();
+                    Console.WriteLine("=== simplegc M1r.2 substrate context ===");
+                    Console.WriteLine($"  MS used   : {mp.MsUsed / 1024.0 / 1024.0,10:F1} MB / committed {mp.MsCommitted / 1024.0 / 1024.0,8:F1} MB / freelist {mp.MsFreelist / 1024.0 / 1024.0,8:F1} MB / live {mp.MsLiveAfter / 1024.0 / 1024.0,8:F1} MB");
+                    Console.WriteLine($"  norefsPerm: {mp.NoRefsPermUsed / 1024.0 / 1024.0,10:F1} MB / committed {mp.NoRefsPermCommitted / 1024.0 / 1024.0,8:F1} MB");
+                }
+                if (lcV == LastCollect.SupportedAbiVersion && lc.CollectId > 0)
+                {
+                    Console.WriteLine($"  lastCollect: id={lc.CollectId} pause={lc.TotalUs}us walk={lc.WalkUs}us sweep={lc.SweepUs}us  freed={lc.BytesFreed / 1024.0 / 1024.0:F1}MB live={lc.BytesLiveAfter / 1024.0 / 1024.0:F1}MB scanned={lc.BytesScanned / 1024.0 / 1024.0:F1}MB");
+                }
+
+                // Smoke: ask the substrate to decommit MS pages above the
+                // bump pointer. Always call so we can prove the P/Invoke is
+                // wired even when there's no slack to release (the native
+                // primitive keeps a 1 MB headroom + page-aligns, so 0 is
+                // the expected return when bump is close to committed).
+                if (mp.MsCommitted > 0)
+                {
+                    ulong before = mp.MsCommitted;
+                    ulong returned = SimpleGCInterop.RequestDecommitMarkSweep(0);
+                    SimpleGCInterop.GetMemoryPressure(&mp);
+                    Console.WriteLine($"  decommit  : returned {returned / 1024.0 / 1024.0,8:F1} MB to OS  (msCommitted {before / 1024.0 / 1024.0:F1} -> {mp.MsCommitted / 1024.0 / 1024.0:F1} MB)");
+                }
+            }
         }
 
         return failures == 0 ? 0 : 2;

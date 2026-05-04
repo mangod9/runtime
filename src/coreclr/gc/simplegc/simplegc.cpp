@@ -558,6 +558,16 @@ namespace
         // correlate walk_arenas_us with the scanned region size.
         std::atomic<uint64_t> last_perm_walk_bytes{0};
         std::atomic<uint64_t> last_request_walk_bytes{0};
+        // M1r.2: last-collect snapshots for the policy-callback context.
+        // Cumulative counters above are still the source of truth for
+        // long-window observation; these are the "what just happened"
+        // values the managed policy reads from the LastCollect getter.
+        std::atomic<uint64_t> last_total_us{0};
+        std::atomic<uint64_t> last_walk_us{0};
+        std::atomic<uint64_t> last_sweep_us{0};
+        std::atomic<uint64_t> last_dead_bytes{0};   // bytes freed by sweep
+        std::atomic<uint64_t> last_live_bytes{0};   // = bytes_live_after_collect snapshot
+        std::atomic<uint64_t> last_ms_walked{0};    // = bump - start_obj at sweep time
     };
     PhaseTimes g_phaseTimes;
 
@@ -2279,6 +2289,10 @@ namespace
         g_marksweep.bytes_collected_total.fetch_add(dead_bytes, std::memory_order_relaxed);
         g_marksweep.n_objects_swept.fetch_add(swept_count, std::memory_order_relaxed);
         g_marksweep.n_collections.fetch_add(1, std::memory_order_relaxed);
+        // M1r.2: record the per-collect dead-bytes delta for the policy
+        // callback context. Stored where ms_sweep computes it (inside STW)
+        // so the LastCollect getter can return a clean per-collect value.
+        g_phaseTimes.last_dead_bytes.store(dead_bytes, std::memory_order_relaxed);
         return live_bytes;
     }
 } // namespace
@@ -3617,6 +3631,20 @@ HRESULT simplegc_force_collect()
         g_phaseTimes.total_us      .fetch_add(totalUs, std::memory_order_relaxed);
         g_phaseTimes.collects      .fetch_add(1,       std::memory_order_relaxed);
 
+        // M1r.2: per-collect snapshots for the LastCollect P/Invoke getter.
+        // Written under STW (no contention); managed callers read them
+        // without coordination. last_dead_bytes is set inside ms_sweep
+        // (where dead_bytes is in scope); we record the rest here.
+        g_phaseTimes.last_total_us  .store(totalUs,  std::memory_order_relaxed);
+        g_phaseTimes.last_walk_us   .store(walkUs,   std::memory_order_relaxed);
+        g_phaseTimes.last_sweep_us  .store(sweepUs,  std::memory_order_relaxed);
+        g_phaseTimes.last_live_bytes.store(
+            g_marksweep.bytes_live_after_collect.load(std::memory_order_relaxed),
+            std::memory_order_relaxed);
+        g_phaseTimes.last_ms_walked .store(
+            (uint64_t)(g_marksweep.bump - g_marksweep.start_obj),
+            std::memory_order_relaxed);
+
         // Always log the per-collect breakdown (LOG1) so harnesses can grep
         // it. Includes scanned arena sizes so we can correlate walk time
         // with region size and compute scan throughput. scan-roots is split
@@ -4105,6 +4133,170 @@ simplegc_get_marksweep_stats(SimpleGCMarkSweepStats* out)
     }
     out->bytes_reserved = (uint64_t)kMarkSweepSize;
 }
+
+// ---------------------------------------------------------------------------
+// M1r.2: extended substrate context exposed to the routing-policy callback
+// ---------------------------------------------------------------------------
+//
+// The original M1r.1 ABI only let the policy read per-MT counters and write
+// per-MT route decisions. M1r.2 adds substrate-wide context so the policy
+// can implement budget-aware strategies:
+//   - SimpleGCMemoryPressure: aggregated used / committed snapshot across
+//     every region (perm, request, marksweep, norefsperm). The managed
+//     callback uses this to decide whether to keep promoting (perm has
+//     headroom) vs demote+decommit (perm tight).
+//   - SimpleGCLastCollect: per-collect timing + bytes-freed/bytes-live
+//     snapshot for the just-completed mark-sweep cycle. Lets the policy
+//     score MS efficacy ("sweep freed 5% of bytes scanned three cycles in
+//     a row → MS region is full of long-lived stuff, promote everything").
+//   - simplegc_request_decommit_marksweep: the substrate-action verb the
+//     policy has been missing. Returns committed-but-unused MS pages back
+//     to the OS. This is the only mechanism in the substrate today that
+//     can actually shrink working set; it's the lever for closing the
+//     peakWS gap measured in the M1r.1 head-to-head.
+//
+// All three structs are abi-versioned (append-only on the native side;
+// managed mirror checks abi_version == kMemoryPressureAbiVersion etc.).
+
+constexpr uint32_t kMemoryPressureAbiVersion = 1;
+
+struct SimpleGCMemoryPressure
+{
+    uint32_t abi_version;         // == kMemoryPressureAbiVersion
+    uint32_t reserved;
+    uint64_t perm_used;
+    uint64_t perm_committed;
+    uint64_t request_used;
+    uint64_t request_committed;
+    uint64_t ms_used;             // bump - start_obj
+    uint64_t ms_committed;
+    uint64_t ms_freelist;
+    uint64_t ms_live_after;       // bytes_live_after_collect snapshot
+    uint64_t ms_reserved;
+    uint64_t norefsperm_used;
+    uint64_t norefsperm_committed;
+};
+static_assert(sizeof(SimpleGCMemoryPressure) == 96, "SimpleGCMemoryPressure ABI");
+
+constexpr uint32_t kLastCollectAbiVersion = 1;
+
+struct SimpleGCLastCollect
+{
+    uint32_t abi_version;         // == kLastCollectAbiVersion
+    uint32_t reserved;
+    uint64_t collect_id;          // monotonic count of completed collects (0 = none yet)
+    uint64_t total_us;            // wall-clock STW pause
+    uint64_t walk_us;
+    uint64_t sweep_us;
+    uint64_t bytes_freed;         // dead_bytes from sweep (this collect only)
+    uint64_t bytes_live_after;    // live bytes in MS after this sweep
+    uint64_t bytes_scanned;       // perm + request + ms walked sizes (this collect)
+};
+static_assert(sizeof(SimpleGCLastCollect) == 64, "SimpleGCLastCollect ABI");
+
+GC_EXPORT
+uint32_t LOCALGC_CALLCONV
+simplegc_get_memory_pressure(SimpleGCMemoryPressure* out)
+{
+    if (out == nullptr) return 0;
+    out->abi_version          = kMemoryPressureAbiVersion;
+    out->reserved             = 0;
+    out->perm_used            = (uint64_t)(g_perm.bump      - g_perm.start);
+    out->perm_committed       = (uint64_t)(g_perm.committed - g_perm.start);
+    out->request_used         = (uint64_t)(g_request.bump      - g_request.start);
+    out->request_committed    = (uint64_t)(g_request.committed - g_request.start);
+    out->norefsperm_used      = (uint64_t)(g_norefsPerm.bump      - g_norefsPerm.start);
+    out->norefsperm_committed = (uint64_t)(g_norefsPerm.committed - g_norefsPerm.start);
+    out->ms_freelist          = g_marksweep.bytes_freelist.load(std::memory_order_relaxed);
+    out->ms_live_after        = g_marksweep.bytes_live_after_collect.load(std::memory_order_relaxed);
+    out->ms_reserved          = (uint64_t)kMarkSweepSize;
+    if (g_marksweep.start_obj != nullptr)
+    {
+        std::lock_guard<std::mutex> guard(g_marksweep.lock);
+        out->ms_used      = (uint64_t)(g_marksweep.bump      - g_marksweep.start_obj);
+        out->ms_committed = (uint64_t)(g_marksweep.committed - g_marksweep.start_obj);
+    }
+    else
+    {
+        out->ms_used      = 0;
+        out->ms_committed = 0;
+    }
+    return kMemoryPressureAbiVersion;
+}
+
+GC_EXPORT
+uint32_t LOCALGC_CALLCONV
+simplegc_get_last_collect(SimpleGCLastCollect* out)
+{
+    if (out == nullptr) return 0;
+    out->abi_version      = kLastCollectAbiVersion;
+    out->reserved         = 0;
+    out->collect_id       = g_phaseTimes.collects.load(std::memory_order_relaxed);
+    out->total_us         = g_phaseTimes.last_total_us.load(std::memory_order_relaxed);
+    out->walk_us          = g_phaseTimes.last_walk_us.load(std::memory_order_relaxed);
+    out->sweep_us         = g_phaseTimes.last_sweep_us.load(std::memory_order_relaxed);
+    out->bytes_freed      = g_phaseTimes.last_dead_bytes.load(std::memory_order_relaxed);
+    out->bytes_live_after = g_phaseTimes.last_live_bytes.load(std::memory_order_relaxed);
+    out->bytes_scanned    = g_phaseTimes.last_perm_walk_bytes.load(std::memory_order_relaxed)
+                          + g_phaseTimes.last_request_walk_bytes.load(std::memory_order_relaxed)
+                          + g_phaseTimes.last_ms_walked.load(std::memory_order_relaxed);
+    return kLastCollectAbiVersion;
+}
+
+// Decommit committed-but-unused MS pages above the bump pointer back to the
+// OS. Returns the number of bytes successfully decommitted (page-aligned,
+// 0 on error / nothing to decommit).
+//
+// hint_bytes = 0 means "decommit as much as possible above bump+headroom";
+// hint_bytes > 0 caps the amount returned. We always retain a small
+// headroom of committed memory above bump so the next chunk-take doesn't
+// immediately re-commit (which would be a pure waste of the syscall).
+//
+// Safety: held under g_marksweep.lock for the duration of the decommit.
+// The MS allocator fast path uses per-thread sub-arenas (within
+// [start_obj, bump)) and never reads g_marksweep.committed without the
+// lock. The slow path that EXTENDS committed (ms_commit / ms_raw_bump) is
+// also lock-held. So serializing decommit on the same lock is correct.
+GC_EXPORT
+uint64_t LOCALGC_CALLCONV
+simplegc_request_decommit_marksweep(uint64_t hint_bytes)
+{
+    if (g_marksweep.start_obj == nullptr) return 0;
+
+    constexpr size_t kPageSize = 4096;
+    // Keep some committed memory above bump to absorb the next several
+    // chunk-takes without an immediate re-commit. 1 MB headroom = ~32
+    // typical chunk-takes at 32 KB each; tunable later.
+    constexpr size_t kHeadroom = 1 * 1024 * 1024;
+
+    std::lock_guard<std::mutex> guard(g_marksweep.lock);
+
+    uint8_t* boundary = g_marksweep.bump + kHeadroom;
+    // Round UP to page boundary so we never decommit a page that contains
+    // the headroom region.
+    boundary = (uint8_t*)(((uintptr_t)boundary + kPageSize - 1) & ~(uintptr_t)(kPageSize - 1));
+    if (boundary >= g_marksweep.committed) return 0;
+
+    uint64_t avail = (uint64_t)(g_marksweep.committed - boundary);
+    uint64_t toDecommit = (hint_bytes == 0 || hint_bytes > avail) ? avail : hint_bytes;
+    // Page-align DOWN so we never decommit a page that crosses the
+    // boundary into the headroom region.
+    toDecommit &= ~((uint64_t)kPageSize - 1);
+    if (toDecommit == 0) return 0;
+
+    uint8_t* decommitStart = g_marksweep.committed - toDecommit;
+    if (!GCToOSInterface::VirtualDecommit(decommitStart, (size_t)toDecommit))
+    {
+        LOG1("simplegc_request_decommit_marksweep: VirtualDecommit(%p, %llu) failed",
+             decommitStart, (unsigned long long)toDecommit);
+        return 0;
+    }
+    g_marksweep.committed = decommitStart;
+    LOG1("simplegc_request_decommit_marksweep: returned %llu bytes (newCommitted=%p)",
+         (unsigned long long)toDecommit, g_marksweep.committed);
+    return toDecommit;
+}
+
 
 // Forward declaration; implementation in the collection section below.
 HRESULT simplegc_force_collect();

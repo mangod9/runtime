@@ -129,6 +129,34 @@ public static class SimpleGCInterop
     /// registered routing-policy callback since process start.</summary>
     [DllImport(Lib, EntryPoint = "simplegc_get_callback_invocations")]
     public static extern ulong GetCallbackInvocations();
+
+    /// <summary>M1r.2: aggregated substrate-wide memory pressure snapshot.
+    /// Returns the ABI version on success (compare against
+    /// <see cref="MemoryPressure.SupportedAbiVersion"/>) or 0 on error.
+    /// The buffer must be the exact size of <see cref="MemoryPressure"/>.
+    /// Lets the policy callback decide budget-aware actions (e.g. demote
+    /// promoted MTs and request decommit when perm is tight).</summary>
+    [DllImport(Lib, EntryPoint = "simplegc_get_memory_pressure")]
+    public static extern unsafe uint GetMemoryPressure(MemoryPressure* outBuf);
+
+    /// <summary>M1r.2: snapshot of the just-completed mark-sweep cycle.
+    /// Returns the ABI version on success (compare against
+    /// <see cref="LastCollect.SupportedAbiVersion"/>) or 0 on error.
+    /// <see cref="LastCollect.CollectId"/> is 0 if no collect has run
+    /// yet, otherwise it monotonically counts completed collects.</summary>
+    [DllImport(Lib, EntryPoint = "simplegc_get_last_collect")]
+    public static extern unsafe uint GetLastCollect(LastCollect* outBuf);
+
+    /// <summary>M1r.2: ask the substrate to return committed-but-unused
+    /// mark-sweep pages back to the OS. Pass <c>0</c> for "as much as
+    /// possible above headroom"; pass a non-zero hint to cap the amount.
+    /// Returns the number of bytes actually decommitted (page-aligned;
+    /// 0 if there is nothing to decommit or the syscall failed). The
+    /// substrate retains a small headroom of committed memory above the
+    /// MS bump pointer so the next chunk-take doesn't immediately
+    /// re-commit.</summary>
+    [DllImport(Lib, EntryPoint = "simplegc_request_decommit_marksweep")]
+    public static extern ulong RequestDecommitMarkSweep(ulong hintBytes);
 }
 
 /// <summary>Mirror of the native <c>SimpleGCMarkSweepStats</c> ABI struct
@@ -156,4 +184,76 @@ public struct MarkSweepStats
     public ulong BytesBumped;
     /// <summary>Total bytes reserved (virtual address range) for the region.</summary>
     public ulong BytesReserved;
+}
+
+/// <summary>M1r.2: mirror of the native <c>SimpleGCMemoryPressure</c> ABI
+/// struct (96 bytes). Aggregates used / committed counters across every
+/// substrate region so the routing-policy callback can take budget-aware
+/// decisions (e.g. stop promoting once perm is over a fraction of cap;
+/// demote + decommit when working set is close to a Job-Object limit).</summary>
+[StructLayout(LayoutKind.Sequential, Pack = 8)]
+public struct MemoryPressure
+{
+    /// <summary>The ABI version this binary expects (used by the C# side
+    /// to validate against the value the native exporter writes).</summary>
+    public const uint SupportedAbiVersion = 1;
+
+    /// <summary>ABI version the substrate filled in. Compare against
+    /// <see cref="SupportedAbiVersion"/>.</summary>
+    public uint AbiVersion;
+    /// <summary>Reserved (always 0).</summary>
+    public uint Reserved;
+    /// <summary>Bytes used in the bump-allocated perm arena.</summary>
+    public ulong PermUsed;
+    /// <summary>Bytes committed by the perm arena.</summary>
+    public ulong PermCommitted;
+    /// <summary>Bytes used in the per-request arena.</summary>
+    public ulong RequestUsed;
+    /// <summary>Bytes committed by the per-request arena.</summary>
+    public ulong RequestCommitted;
+    /// <summary>Bytes ever bumped in the mark-sweep region (high-water).</summary>
+    public ulong MsUsed;
+    /// <summary>Bytes committed by the mark-sweep region.</summary>
+    public ulong MsCommitted;
+    /// <summary>Bytes currently sitting on the MS free list.</summary>
+    public ulong MsFreelist;
+    /// <summary>Live bytes in MS as of the last completed sweep.</summary>
+    public ulong MsLiveAfter;
+    /// <summary>Total reserved (virtual address space) for the MS region.</summary>
+    public ulong MsReserved;
+    /// <summary>Bytes used in the no-refs perm sub-arena (M1g).</summary>
+    public ulong NoRefsPermUsed;
+    /// <summary>Bytes committed by the no-refs perm sub-arena.</summary>
+    public ulong NoRefsPermCommitted;
+}
+
+/// <summary>M1r.2: mirror of the native <c>SimpleGCLastCollect</c> ABI
+/// struct (64 bytes). Per-collect snapshot of timing + bytes-freed for
+/// the most recently completed mark-sweep cycle. Used by the routing
+/// policy to score MS efficacy ("sweep freed less than 20% of bytes
+/// scanned three cycles in a row → MS is full of long-lived stuff").</summary>
+[StructLayout(LayoutKind.Sequential, Pack = 8)]
+public struct LastCollect
+{
+    /// <summary>The ABI version this binary expects.</summary>
+    public const uint SupportedAbiVersion = 1;
+
+    /// <summary>ABI version the substrate filled in.</summary>
+    public uint AbiVersion;
+    /// <summary>Reserved (always 0).</summary>
+    public uint Reserved;
+    /// <summary>Monotonic count of completed collects (0 = none yet).</summary>
+    public ulong CollectId;
+    /// <summary>STW pause time (microseconds) for this collect.</summary>
+    public ulong TotalUs;
+    /// <summary>Walk-arenas phase time (microseconds).</summary>
+    public ulong WalkUs;
+    /// <summary>Sweep phase time (microseconds).</summary>
+    public ulong SweepUs;
+    /// <summary>Bytes freed by sweep (this collect only).</summary>
+    public ulong BytesFreed;
+    /// <summary>Live bytes in MS after this sweep.</summary>
+    public ulong BytesLiveAfter;
+    /// <summary>Total bytes scanned (perm + request + ms) this collect.</summary>
+    public ulong BytesScanned;
 }
