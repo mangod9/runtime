@@ -236,6 +236,22 @@ namespace
     std::atomic<uint64_t> g_gen0OverflowToMsCount{0};
     std::atomic<uint64_t> g_gen0OverflowToMsBytes{0};
 
+    // M1o.0b: decision-gate measurement state. We piggyback a no-op
+    // GcScanRoots(condemned=0, max_gen=0) call onto the first N MS
+    // force_collect rounds — that's when we have real STW + real working
+    // set + real stacks, exactly the conditions where the existing
+    // GcScanRoots(2,2) costs ~109 ms on Fortunes. If the (0,0) shadow scan
+    // is materially faster we know the EE elides walks at max_gen=0 and a
+    // gen0 nursery is worth building. If it isn't, no copy collector will
+    // shrink pause and we'd pivot.
+    //
+    // Gated by SIMPLEGC_SHADOW_GEN0_SCAN_RUNS=N (default 0 = off). The
+    // shadow scan is inside the same SuspendEE/RestartEE window as the real
+    // scan so there's no extra pause beyond the shadow walk itself.
+    std::atomic<int>      g_shadowScanCount{0};
+    std::atomic<int>      g_gen0RootCbHits{0};
+    int                   g_shadowScanRuns = 0;
+
     // ---- M1b: mark-sweep region ---------------------------------------------
     //
     // A *third* region in the same VirtualReserve, but with real STW mark-sweep
@@ -1105,6 +1121,21 @@ static bool simplegc_init_heap()
             LOG1("SIMPLEGC_DEFAULT_ROUTE=gen0");
         }
     }
+    // M1o.0b: SIMPLEGC_SHADOW_GEN0_SCAN_RUNS=N — at the start of the next
+    // N MS force_collect rounds, do a shadow GcScanRoots(0,0) before the
+    // real GcScanRoots(2,2) and log both timings. Default 0 (off).
+    if (const char* v = std::getenv("SIMPLEGC_SHADOW_GEN0_SCAN_RUNS"))
+    {
+        if (*v != '\0')
+        {
+            int n = std::atoi(v);
+            if (n > 0)
+            {
+                g_shadowScanRuns = n;
+                LOG1("SIMPLEGC_SHADOW_GEN0_SCAN_RUNS=%d", n);
+            }
+        }
+    }
     // M1l measure: SIMPLEGC_CHUNK_KB tunes the MS chunk-take size.
     // Default 8 KB (kAllocCtxQuantDefault). Bigger reduces lock contention
     // on g_marksweep.lock but increases per-chunk slack waste under tight caps.
@@ -1510,6 +1541,19 @@ namespace
         {
             g_grayQueue.push_back(obj);
         }
+    }
+
+    // M1o.0b: no-op root counter callback for the shadow GcScanRoots pass.
+    // We DO NOT mark, copy, or otherwise mutate state — the goal is purely
+    // to measure how long the EE takes to walk and report roots at
+    // (condemned, max_gen) = (0, 0). Counts callbacks per pass so we can
+    // also see whether max_gen=0 enumerates fewer roots, not just runs
+    // faster.
+    static void LOCALGC_CALLCONV simplegc_gen0_count_root_cb(PTR_PTR_Object /*ppObj*/,
+                                                             ScanContext*  /*sc*/,
+                                                             uint32_t      /*flags*/)
+    {
+        g_gen0RootCbHits.fetch_add(1, std::memory_order_relaxed);
     }
 
     // Linear scan to find the object whose [start, start+size) covers `interior`.
@@ -3222,6 +3266,30 @@ HRESULT simplegc_force_collect()
         ScanContext sc{};
         sc.promotion = TRUE;
         sc.concurrent = FALSE;
+
+        // M1o.0b: shadow scan_roots(0,0) before the real (2,2). Same STW
+        // window so it adds at most the shadow walk's own time to the
+        // pause; gives apples-to-apples timing under steady-state load.
+        // Runs only for the first SIMPLEGC_SHADOW_GEN0_SCAN_RUNS collects
+        // (default 0 = off) so production runs aren't slowed down.
+        if (g_shadowScanRuns > 0 &&
+            g_shadowScanCount.load(std::memory_order_relaxed) < g_shadowScanRuns)
+        {
+            g_gen0RootCbHits.store(0, std::memory_order_relaxed);
+            auto sa = ms_clock::now();
+            ScanContext shadowSc{};
+            shadowSc.promotion = TRUE;
+            shadowSc.concurrent = FALSE;
+            GCToEEInterface::GcScanRoots(&simplegc_gen0_count_root_cb,
+                                         /*condemned*/ 0, /*max_gen*/ 0, &shadowSc);
+            auto sb = ms_clock::now();
+            int shadowRoots = g_gen0RootCbHits.load(std::memory_order_relaxed);
+            long long shadowUs = std::chrono::duration_cast<std::chrono::microseconds>(sb - sa).count();
+            LOG1("force_collect: shadow scan_roots(0,0)=%lld us roots=%d",
+                 shadowUs, shadowRoots);
+            g_shadowScanCount.fetch_add(1, std::memory_order_relaxed);
+        }
+
         GCToEEInterface::GcScanRoots(&ms_promote_callback, /*condemned*/ 2, /*max_gen*/ 2, &sc);
         auto t1b = ms_clock::now();   // after GcScanRoots (runtime-side)
 
