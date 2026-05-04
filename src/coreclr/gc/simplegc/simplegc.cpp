@@ -160,6 +160,40 @@ namespace
     uint8_t* g_permWalkedHigh   = nullptr;   // highest-scanned perm.bump
     uint8_t* g_requestWalkedHigh= nullptr;   // highest-scanned request.bump
 
+    // M1n.1: opt-in card-aware perm/request walk. When SIMPLEGC_USE_CARDS=1,
+    // the conservative walk consults the JIT-maintained card table and
+    // scans only cards whose dirty byte is non-zero (i.e., regions that
+    // had a managed reference store since the last walk).
+    //
+    // STICKY-CARD SEMANTICS — why we don't just clear cards after walking:
+    //   The runtime's card table is designed for generational GC, where
+    //   "old gen -> young gen" refs are recreated each cycle (because
+    //   young objects are short-lived). For our model, an MS object can
+    //   be referenced from a perm field set ONCE during warmup, and that
+    //   ref persists across many MS collects. If we simply cleared the
+    //   card after a walk, the next collect would see a clean card and
+    //   miss the persistent perm->MS ref → sweep the live target → AV.
+    //
+    //   Instead: after walking a dirty card, we LEAVE it dirty if we
+    //   found at least one MS-pointer candidate inside it (so that ref
+    //   slot is re-scanned next cycle). If the card had a write barrier
+    //   fire but no actual MS-ref candidate (e.g., perm->perm or
+    //   perm->frozen pointer write), we clear it. The JIT barrier will
+    //   re-dirty on any future store. This is functionally a *remembered
+    //   set* for inter-region refs, encoded in the card table itself.
+    //
+    // SAFETY: Unlike SIMPLEGC_PERM_IMMUTABLE, this mode is safe for
+    // workloads that mutate perm fields (Kestrel, etc.) — the JIT
+    // barrier dirties the card on every store, so we will re-scan that
+    // 2 KB region on the next collect.
+    //
+    // First-collect bootstrap: we trust JIT barriers from process start.
+    // simplegc.Initialize() publishes WriteBarrierParameters very early
+    // (before any managed reference store into our heap), so cards are
+    // dirty for every reachable perm->MS ref by the time the first
+    // collect runs. Empirically validated via dirty-card counting.
+    bool   g_useCardsOptIn = false;
+
     // Each arena owns its own bump pointer, committed-watermark, and lock.
     struct Arena
     {
@@ -1067,6 +1101,16 @@ static bool simplegc_init_heap()
             LOG1("SIMPLEGC_PERM_IMMUTABLE=1 (incremental perm walk enabled)");
         }
     }
+    // M1n.1: SIMPLEGC_USE_CARDS=1 opts into card-aware perm/request walk.
+    // See declaration of g_useCardsOptIn for the sticky-card semantics.
+    if (const char* v = std::getenv("SIMPLEGC_USE_CARDS"))
+    {
+        if (*v != '\0' && *v != '0')
+        {
+            g_useCardsOptIn = true;
+            LOG1("SIMPLEGC_USE_CARDS=1 (card-aware perm/request walk enabled)");
+        }
+    }
     // ---- M1m.1: cap-aware auto-tune from DOTNET_GCHeapHardLimit ----
     // When the runtime is configured with a hard heap-size limit (typical
     // for containers), auto-engage the policy-mode defaults so plain
@@ -1719,6 +1763,104 @@ namespace
         LOG1("ms_walk_arena[conservative]: start=%p bump=%p "
              "scanned=%zu marked=%zu",
              arena.start, arena.bump, scanned, marked);
+    }
+
+    // M1n.1: Card-aware variant of ms_walk_arena_for_external_refs. Scans
+    // only cards whose dirty byte is non-zero (i.e., regions that had a
+    // managed reference store fire the JIT card-dirty barrier since the
+    // last walk).
+    //
+    // Sticky-card semantics: after walking a dirty card, we LEAVE it
+    // dirty if we found any MS-pointer candidate inside it (so that ref
+    // slot is re-scanned next cycle). Otherwise we clear it. The JIT
+    // barrier re-dirties on any future store. See declaration of
+    // g_useCardsOptIn for the full safety rationale.
+    //
+    // Pre-conditions identical to ms_walk_arena_for_external_refs:
+    //   - Caller holds g_marksweep.lock.
+    //   - EE is suspended.
+    //   - ms_build_object_start_index() has been invoked.
+    static void ms_walk_arena_card_aware(Arena& arena)
+    {
+        constexpr size_t kStartPadding = 64;
+        constexpr int    kCardByteShift = 11;
+        constexpr size_t kCardSize = size_t(1) << kCardByteShift;
+
+        if (arena.start == nullptr) return;
+        if (g_msStartsCache.empty())
+        {
+            LOG1("ms_walk_arena[card]: arena=[%p..%p) MS index empty - skipping",
+                 arena.start, arena.bump);
+            return;
+        }
+
+        uint8_t* arenaLo = arena.start + kStartPadding;
+        uint8_t* arenaHi = arena.bump;
+        arenaLo = reinterpret_cast<uint8_t*>(
+                    reinterpret_cast<uintptr_t>(arenaLo) & ~uintptr_t(7));
+        if (arenaLo >= arenaHi) return;
+
+        uint8_t* msLo = g_msStartsCache.front();
+        uint8_t* msHi = g_msStartsCache.back();
+
+        // Card-table buffer is biased so the runtime barrier can index by
+        // absolute address: g_gc_card_table[(dst >> 11)]. Our raw buffer
+        // (g_cardTable) is indexed by offset (cardIdx - heapBaseIdx).
+        size_t   heapBaseIdx = reinterpret_cast<size_t>(g_heapStart) >> kCardByteShift;
+        uint8_t* cardBytes   = reinterpret_cast<uint8_t*>(g_cardTable);
+
+        size_t firstCard = reinterpret_cast<size_t>(arenaLo) >> kCardByteShift;
+        size_t lastCard  = (reinterpret_cast<size_t>(arenaHi - 1) >> kCardByteShift) + 1;
+
+        size_t scanned = 0, marked = 0, dirtyCards = 0, stickyCards = 0;
+        size_t totalCards = (lastCard > firstCard) ? (lastCard - firstCard) : 0;
+
+        for (size_t card = firstCard; card < lastCard; ++card)
+        {
+            size_t bufIdx = card - heapBaseIdx;
+            if (cardBytes[bufIdx] == 0) continue;
+            ++dirtyCards;
+
+            uint8_t* cardLo = reinterpret_cast<uint8_t*>(card << kCardByteShift);
+            uint8_t* cardHi = cardLo + kCardSize;
+            if (cardLo < arenaLo) cardLo = arenaLo;
+            if (cardHi > arenaHi) cardHi = arenaHi;
+
+            bool foundCandidate = false;
+            for (uint8_t* p = cardLo; p + sizeof(uint8_t*) <= cardHi; p += sizeof(uint8_t*))
+            {
+                uint8_t* candidate = *reinterpret_cast<uint8_t**>(p);
+                ++scanned;
+                if (candidate >= msLo && candidate <= msHi
+                    && ms_is_object_start(candidate))
+                {
+                    foundCandidate = true;
+                    if (ms_test_and_set_mark(candidate))
+                    {
+                        g_grayQueue.push_back(candidate);
+                        ++marked;
+                    }
+                }
+            }
+
+            if (foundCandidate)
+            {
+                // Persistent inter-region ref source: keep dirty so we
+                // re-scan next cycle even without a new managed write.
+                ++stickyCards;
+            }
+            else
+            {
+                // No MS-ref candidates here: this card was dirtied by a
+                // perm->perm, perm->frozen, or perm->scalar write. Clear
+                // it; the JIT barrier will re-dirty on any future store.
+                cardBytes[bufIdx] = 0;
+            }
+        }
+
+        LOG1("ms_walk_arena[card]: arena=[%p..%p) cards=%zu dirty=%zu sticky=%zu "
+             "scanned=%zu marked=%zu",
+             arenaLo, arenaHi, totalCards, dirtyCards, stickyCards, scanned, marked);
     }
 
     // Callback for IGCToCLR::GcEnumAllocContexts. Encodes any abandoned chunk
@@ -3005,13 +3147,26 @@ HRESULT simplegc_force_collect()
             if (g_permWalkedHigh    > g_perm.bump)    g_permWalkedHigh    = nullptr;
             if (g_requestWalkedHigh > g_request.bump) g_requestWalkedHigh = nullptr;
         }
-        uint8_t* permWalkStart    = g_permImmutableOptIn ? g_permWalkedHigh    : nullptr;
-        uint8_t* requestWalkStart = g_permImmutableOptIn ? g_requestWalkedHigh : nullptr;
-        ms_walk_arena_for_external_refs(g_perm,    permWalkStart);
-        ms_walk_arena_for_external_refs(g_request, requestWalkStart);
+        if (g_useCardsOptIn)
+        {
+            // Card-aware walk: scan only dirty cards. Sticky-card
+            // semantics keep persistent inter-region refs tracked across
+            // collects. NOTE: PERM_IMMUTABLE incremental walk is
+            // incompatible with cards (cards already give per-2KB
+            // precision; running both would skip persistent refs whose
+            // cards are sticky but whose source is below permWalkedHigh).
+            ms_walk_arena_card_aware(g_perm);
+            ms_walk_arena_card_aware(g_request);
+        }
+        else
+        {
+            uint8_t* permWalkStart    = g_permImmutableOptIn ? g_permWalkedHigh    : nullptr;
+            uint8_t* requestWalkStart = g_permImmutableOptIn ? g_requestWalkedHigh : nullptr;
+            ms_walk_arena_for_external_refs(g_perm,    permWalkStart);
+            ms_walk_arena_for_external_refs(g_request, requestWalkStart);
+        }
         if (g_permImmutableOptIn)
         {
-            // Record high-watermark for next collect.
             g_permWalkedHigh    = g_perm.bump;
             g_requestWalkedHigh = g_request.bump;
         }
