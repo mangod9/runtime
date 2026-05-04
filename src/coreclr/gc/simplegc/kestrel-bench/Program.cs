@@ -102,11 +102,33 @@ internal static class SimpleGC
 
     public static void RequestBegin()
     {
-        // SAFETY: see Server.Build() — the per-request bracket is incompatible
-        // with ASP.NET async middleware. Kept as a no-op here so anything
-        // calling it from this binary cannot accidentally re-introduce the
-        // torn-reference race. The native primitive is still exported and
-        // remains safe in single-threaded synchronous contexts (policy-demo).
+        // SAFETY: M1q.3 introduced a per-thread arena slot pool in native
+        // code (each thread claims its own 8 MB sub-arena from g_request).
+        // The native primitive is correct and safe for single-threaded
+        // synchronous callers like policy-demo.
+        //
+        // ASP.NET INTEGRATION IS STILL UNSAFE because Kestrel's async
+        // pipeline hops threads even when the user handler appears
+        // synchronous. The empirical failure (verified on this branch):
+        //
+        //   begin runs on Thread A → claims slot S, sets t_activeArena
+        //                            and t_perThreadCheckpoint on A
+        //   await next() returns on Thread B
+        //   end runs on Thread B → t_activeArena is null on B → no-op
+        //   next request on Thread A → begin treats it as nested (its
+        //     t_activeArena is still set), checkpoint NOT updated → the
+        //     CURRENT request allocates above an OLDER checkpoint
+        //   eventual end on whoever holds A's TLS → rewinds to that
+        //     OLDER checkpoint, freeing in-flight allocations of every
+        //     overlapping request → torn String / StringBuilder buffer
+        //     → AV in Buffer.MemmoveInternal during response render.
+        //
+        // The proper ASP.NET integration needs an AsyncLocal-based slot
+        // assignment that flows with ExecutionContext (not thread-local).
+        // That's a separate design and is parked. Until then, this
+        // method is a NO-OP from kestrel-bench so nothing in this binary
+        // can re-trigger the corruption while the M1q.1 adaptive policy
+        // (which already wins) drives the routing.
     }
 
     public static ulong RequestEnd() => 0UL;
@@ -201,12 +223,46 @@ internal static class SimpleGC
 
 internal static class ManagedSeed
 {
-    /// <summary>Types known to be hot in the Fortunes endpoint. The list
-    /// is intentionally short and explicit so the diff between "what the
-    /// app allocates" and "what we promote" is auditable.</summary>
-    public static readonly Type[] FortunesHotTypes = BuildFortunesHotTypes();
+    // ---- M1q.2: split lists per endpoint --------------------------------
+    //
+    // Each endpoint exposes its own type list. The bench dispatches on
+    // --ep <fortunes|search|items> at startup. Apps deployed for one
+    // workload only pay for that workload's hot types — the customized GC
+    // for a Fortunes app is literally different code (different seed list)
+    // from the customized GC for a Search app.
 
-    private static Type[] BuildFortunesHotTypes()
+    /// <summary>BCL + reflection + DI types that warm up regardless of
+    /// which endpoint is served. Always seeded.</summary>
+    public static readonly Type[] BaseHotTypes = BuildBaseHotTypes();
+
+    /// <summary>Types only Fortunes allocates (per request: 13 Fortune
+    /// instances + a Fortune[] view + List&lt;Fortune&gt; sort scratch).</summary>
+    public static readonly Type[] FortunesEndpointTypes =
+    {
+        typeof(Fortune),
+        typeof(Fortune[]),
+        typeof(System.Collections.Generic.List<Fortune>),
+    };
+
+    /// <summary>Types only the Items endpoint allocates.</summary>
+    public static readonly Type[] ItemsEndpointTypes =
+    {
+        typeof(Item),
+        typeof(Item[]),
+        typeof(ItemsResponse),
+    };
+
+    /// <summary>Types only the Search endpoint allocates. Catalog
+    /// `Product` lives forever in perm so it isn't here; what cycles is
+    /// the per-request projection.</summary>
+    public static readonly Type[] SearchEndpointTypes =
+    {
+        typeof(Product),
+        typeof(ProductSummary),
+        typeof(ProductSummary[]),
+    };
+
+    private static Type[] BuildBaseHotTypes()
     {
         // RuntimeMethodInfo / RuntimeConstructorInfo are internal CLR types,
         // so we can't reference them with typeof. Discover them at runtime
@@ -226,25 +282,9 @@ internal static class ManagedSeed
             typeof(int[]),
             typeof(object),
 
-            // Bench-defined Fortunes types — the per-request allocation
-            // signature: 13 Fortune instances + a Fortune[] view.
-            typeof(Fortune),
-            typeof(Fortune[]),
-            typeof(System.Collections.Generic.List<Fortune>),
-
-            // Items / Search endpoint hot types (kept seeded so the same
-            // bench binary works across endpoints; harmless on Fortunes).
-            typeof(Item),
-            typeof(ItemsResponse),
-            typeof(Product),
-            typeof(ProductSummary),
-            typeof(ProductSummary[]),
-
             // Reflection / DI / runtime internals that warm up during
-            // Kestrel + ASP.NET startup. These are not allocated per-request
-            // in steady state but they hit MS during warmup; without seeding
-            // them, the first collect fires before warmup ends. Identified
-            // from the OBSERVE-mode survival snapshot in the M1p.0 work.
+            // Kestrel + ASP.NET startup. Identified from the OBSERVE-mode
+            // survival snapshot in the M1p.0 work.
             runtimeMethodInfoType,
             runtimeCtorInfoType,
             typeof(System.Reflection.ParameterInfo),
@@ -254,9 +294,43 @@ internal static class ManagedSeed
         };
     }
 
+    /// <summary>Backwards-compat full list — kept so the previous
+    /// SeedFortunes() entry-point still works. Equivalent to
+    /// SeedForEndpoint("fortunes") prior to M1q.2's split.</summary>
+    public static readonly Type[] FortunesHotTypes = BuildFortunesHotTypes();
+
+    private static Type[] BuildFortunesHotTypes()
+    {
+        var list = new System.Collections.Generic.List<Type>();
+        list.AddRange(BaseHotTypes);
+        list.AddRange(FortunesEndpointTypes);
+        return list.ToArray();
+    }
+
     public static (int attempted, int succeeded) SeedFortunes()
     {
         return SimpleGC.SeedRoutes(FortunesHotTypes, SimpleGC.RouteForcePerm);
+    }
+
+    /// <summary>M1q.2 — seed only the types this app actually needs.
+    /// Composes <see cref="BaseHotTypes"/> with the endpoint-specific
+    /// list. Returns (attempted, succeeded, endpointName).</summary>
+    public static (int attempted, int succeeded, string endpoint) SeedForEndpoint(string endpoint)
+    {
+        Type[] endpointTypes = endpoint switch
+        {
+            "fortunes" => FortunesEndpointTypes,
+            "items"    => ItemsEndpointTypes,
+            "search"   => SearchEndpointTypes,
+            _          => Array.Empty<Type>(),
+        };
+
+        int att = 0, ok = 0;
+        var (a1, o1) = SimpleGC.SeedRoutes(BaseHotTypes,    SimpleGC.RouteForcePerm);
+        att += a1; ok += o1;
+        var (a2, o2) = SimpleGC.SeedRoutes(endpointTypes, SimpleGC.RouteForcePerm);
+        att += a2; ok += o2;
+        return (att, ok, endpoint);
     }
 }
 
@@ -725,27 +799,31 @@ internal static class Server
                 });
                 web.Configure(app =>
                 {
-                    // NOTE: a per-request RequestBegin/RequestEnd bracket was
-                    // tried here but is fundamentally incompatible with ASP.NET
-                    // async middleware. Two compounding correctness bugs:
-                    //   1. simplegc_request_begin sets a per-thread "active
-                    //      arena" flag. If `await next()` resumes on a
-                    //      different thread, RequestEnd runs there as a no-op
-                    //      (its t_activeArena is null), and the originating
-                    //      thread's flag stays armed forever -- it leaks all
-                    //      future allocations into the request arena.
-                    //   2. Even when end DOES fire on the begin thread, it
-                    //      rewinds the GLOBAL g_request.bump pointer while
-                    //      other in-flight requests still have live objects
-                    //      above the checkpoint. New allocations overwrite
-                    //      them, producing torn references that AV in the
-                    //      Pipelines path (e.g. ChkCastClassSpecial on a
-                    //      ReadOnlySequence<byte>._startObject pointing into
-                    //      reused memory).
-                    // For multi-threaded async servers, the request-arena
-                    // primitive needs either per-request arenas or quiescent-
-                    // point rewind, neither of which exists today. M1j drives
-                    // the win via the policy + NoRefsPerm sub-arena instead.
+                    // M1q.3 ATTEMPT — REVERTED. A per-request bracket using
+                    // simplegc_request_begin/end (now backed by per-thread
+                    // arena slots) was tried here. It crashes ASP.NET with
+                    // a torn-buffer AV in Buffer.MemmoveInternal because
+                    // Kestrel's async pipeline hops threads even when the
+                    // user handler is synchronous:
+                    //
+                    //   T_A begin → claims slot, sets t_activeArena on A
+                    //   await next() returns on T_B
+                    //   T_B end → no-op (t_activeArena null on B)
+                    //   next request on T_A → begin sees t_activeArena set
+                    //     → treated as nested → checkpoint NOT updated for
+                    //     the new request → eventual end rewinds to an
+                    //     OLDER checkpoint → freed memory of in-flight
+                    //     overlapping requests → torn string buffers.
+                    //
+                    // The native primitive is now multi-thread-safe in the
+                    // sense that two DIFFERENT threads cannot stomp on each
+                    // other's slots; but a SINGLE thread interleaved with
+                    // async hops still corrupts. ASP.NET integration needs
+                    // an AsyncLocal-based slot assignment that flows with
+                    // ExecutionContext. That's a separate design and is
+                    // parked. The M1q.1 adaptive policy already wins on
+                    // Fortunes (38,483 rps / 832 µs p99 — beats default WKS
+                    // and matches M1p.0 native) without needing this.
 
                     app.Run(async ctx =>
                     {
@@ -1231,20 +1309,21 @@ internal static class Program
         await host.StartAsync();
         Console.WriteLine($"server started. catalog has {Catalog.Products.Length:N0} products.");
 
-        // M1q.0 — managed startup seed. When SIMPLEGC_USE_MANAGED_SEED=1
+        // M1q.0/M1q.2 — managed startup seed. When SIMPLEGC_USE_MANAGED_SEED=1
         // is set, route a hand-picked list of hot types directly to perm
-        // BEFORE serving any request. This is the managed counterpart to
-        // M1p.0's native count-based promotion: the *decision* of which
-        // types to promote lives entirely in C# (see ManagedSeed.cs) so an
-        // LLM looking at the codebase could regenerate it for any app.
+        // BEFORE serving any request. M1q.2 split: the seed is now
+        // *endpoint-specific* — apps deployed for one workload only pay
+        // for that workload's hot types. The decision of which types to
+        // promote lives entirely in C# (see ManagedSeed) so an LLM looking
+        // at the codebase could regenerate it for any app.
         if (SimpleGC.IsLoaded)
         {
             string? seedEnv = Environment.GetEnvironmentVariable("SIMPLEGC_USE_MANAGED_SEED");
             if (!string.IsNullOrEmpty(seedEnv) && seedEnv != "0")
             {
                 SimpleGC.EnableAutoRouteDefault(true);
-                var (att, ok) = ManagedSeed.SeedFortunes();
-                Console.WriteLine($"  managed seed    : {ok}/{att} types pinned to perm (auto-routing ON)");
+                var (att, ok, ep) = ManagedSeed.SeedForEndpoint(endpoint);
+                Console.WriteLine($"  managed seed    : {ok}/{att} types pinned to perm for ep={ep} (auto-routing ON)");
             }
         }
 

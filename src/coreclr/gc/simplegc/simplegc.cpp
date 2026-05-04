@@ -341,6 +341,33 @@ namespace
     // walking all alloc contexts.
     thread_local gc_alloc_context* t_lastAllocCtx = nullptr;
 
+    // ------------------------------------------------------------------
+    // M1q.3 — per-thread request arenas.
+    //
+    // Subdivides the existing 256 MB g_request region into N fixed-size
+    // sub-arenas, one assigned to each thread that calls request_begin.
+    // Each thread owns its slot for life — no shared bump pointer, no
+    // shared checkpoint, no cross-thread coordination needed for rewind.
+    //
+    // bumpable_arena_range() doesn't need updating because every slot's
+    // address range is inside [g_request.start, g_request.end). The
+    // cross-region scan walks per claimed slot rather than g_request.
+    // ------------------------------------------------------------------
+    constexpr int    kPerThreadArenaCount = 32;
+    constexpr size_t kPerThreadArenaSize  = 8 * 1024 * 1024;  // 8 MB
+    static_assert(kPerThreadArenaCount * kPerThreadArenaSize <= 256ULL * 1024 * 1024,
+                  "per-thread arenas must fit inside g_request reservation");
+
+    Arena g_perThreadArenas[kPerThreadArenaCount];
+    std::atomic<bool> g_perThreadArenaClaimed[kPerThreadArenaCount];
+    std::atomic<int>  g_perThreadArenaInUseCount{0};
+    bool g_perThreadArenasInitialized = false;
+
+    // TLS: the slot this thread owns (null until first request_begin).
+    thread_local Arena*   t_perThreadReqArena   = nullptr;
+    // TLS: bump pointer at request_begin entry, used to rewind on end.
+    thread_local uint8_t* t_perThreadCheckpoint = nullptr;
+
     // Forward declaration: defined further down in this namespace once the
     // M1a per-MT counter machinery is set up. Used by
     // simplegc_flush_alloc_context.
@@ -1061,6 +1088,38 @@ static bool simplegc_init_heap()
         return false;
     }
     g_request.committed = g_request.start + ((kStartPadding + 4095) & ~static_cast<size_t>(4095));
+
+    // M1q.3 — carve per-thread request sub-arenas inside g_request. Each
+    // thread that calls simplegc_request_begin claims one slot for life;
+    // slot rewind is fully local (no shared state). g_request itself is
+    // kept as the parent reservation but its bump no longer advances.
+    for (int i = 0; i < kPerThreadArenaCount; i++)
+    {
+        Arena& a = g_perThreadArenas[i];
+        a.start     = g_request.start + (size_t)i * kPerThreadArenaSize;
+        a.end       = a.start + kPerThreadArenaSize;
+        a.committed = a.start;
+        // First slot reuses g_request's already-committed start padding.
+        // Subsequent slots commit their own padding so the sync-block
+        // prefix at start-8 is readable when the slot is first used.
+        if (i == 0)
+        {
+            a.bump      = a.start + kStartPadding;
+            a.committed = a.start + ((kStartPadding + 4095) & ~static_cast<size_t>(4095));
+        }
+        else
+        {
+            if (!GCToOSInterface::VirtualCommit(a.start, kStartPadding))
+            {
+                LOG1("VirtualCommit(per-thread arena start padding) failed");
+                return false;
+            }
+            a.bump      = a.start + kStartPadding;
+            a.committed = a.start + ((kStartPadding + 4095) & ~static_cast<size_t>(4095));
+        }
+        g_perThreadArenaClaimed[i].store(false, std::memory_order_relaxed);
+    }
+    g_perThreadArenasInitialized = true;
 
     // Mark-sweep region: third sub-range of the same VirtualReserve, immediately
     // after the request arena.
@@ -3445,6 +3504,20 @@ HRESULT simplegc_force_collect()
             // cards are sticky but whose source is below permWalkedHigh).
             ms_walk_arena_card_aware(g_perm);
             ms_walk_arena_card_aware(g_request);
+            // M1q.3: walk every claimed per-thread request arena. Each is
+            // its own bumpable region carved from g_request's reservation;
+            // bumpable_arena_range() already accepts these addresses since
+            // they lie inside [g_request.start, g_request.end).
+            if (g_perThreadArenasInitialized)
+            {
+                for (int i = 0; i < kPerThreadArenaCount; i++)
+                {
+                    if (!g_perThreadArenaClaimed[i].load(std::memory_order_acquire))
+                        continue;
+                    Arena& a = g_perThreadArenas[i];
+                    if (a.bump > a.start) ms_walk_arena_card_aware(a);
+                }
+            }
             // M1o.0a: gen0 holds live objects too; their refs into MS must
             // be discovered during MS collect or MS would sweep targets
             // referenced only from gen0. M1o.0c will replace this
@@ -3459,6 +3532,17 @@ HRESULT simplegc_force_collect()
             uint8_t* requestWalkStart = g_permImmutableOptIn ? g_requestWalkedHigh : nullptr;
             ms_walk_arena_for_external_refs(g_perm,    permWalkStart);
             ms_walk_arena_for_external_refs(g_request, requestWalkStart);
+            // M1q.3: see card-aware branch comment.
+            if (g_perThreadArenasInitialized)
+            {
+                for (int i = 0; i < kPerThreadArenaCount; i++)
+                {
+                    if (!g_perThreadArenaClaimed[i].load(std::memory_order_acquire))
+                        continue;
+                    Arena& a = g_perThreadArenas[i];
+                    if (a.bump > a.start) ms_walk_arena_for_external_refs(a, nullptr);
+                }
+            }
             // M1o.0a: see comment above for the cards branch.
             if (g_gen0.bump > g_gen0.start) ms_walk_arena_for_external_refs(g_gen0, nullptr);
         }
@@ -3729,71 +3813,105 @@ simplegc_get_promoted_mt_count()
 //     references before request_end. A real integration would enforce this at
 //     compile time (the LLM-strategy story) or with runtime escape analysis.
 //
-// Currently single-threaded: t_activeArena and t_lastAllocCtx are thread-local;
-// only the calling thread is affected. Multi-threaded bracket support requires
-// per-thread request arenas plus EE suspension on flush — out of scope here.
+// M1q.3: each thread that calls request_begin claims its own slot from the
+// per-thread arena pool. Per-slot bump and rewind are entirely thread-local;
+// no cross-thread coordination, no shared checkpoint, no global counter.
+// The contract is now THREAD-AFFINE: begin and end MUST run on the same
+// thread (or end on a thread that hasn't called begin will be a no-op). For
+// ASP.NET, this means request-bracket middleware is only safe if no async
+// continuation hops threads between begin and end.
 
 GC_EXPORT
 uint64_t LOCALGC_CALLCONV
 simplegc_request_begin()
 {
-    if (t_activeArena == &g_request)
+    if (t_activeArena != nullptr && t_activeArena == t_perThreadReqArena)
     {
-        // Already inside a request. Nested begins are not supported.
+        // Already inside a request on this thread. Nested begins ignored.
         LOG1("simplegc_request_begin: nested call ignored");
         return 0;
     }
 
-    // Snapshot the current bump position so request_end can rewind to here.
+    if (!g_perThreadArenasInitialized)
     {
-        std::lock_guard<std::mutex> guard(g_request.lock);
-        g_request.checkpoint = g_request.bump;
+        LOG1("simplegc_request_begin: per-thread arenas not initialized");
+        return 0;
     }
-    t_activeArena = &g_request;
 
-    // Force the next allocation to refill from the request arena by zeroing
-    // out the cached alloc context's pointers. Without this, the runtime's
-    // fast path would keep bumping in whichever chunk the perm arena gave us
-    // last.
-    // Flush the alloc-context cache (combined_limit + alloc_ptr + alloc_limit)
-    // so the very next allocation falls into our slow-path Alloc and refills
-    // a fresh chunk from the request arena.
+    // First begin on this thread — claim a slot from the pool.
+    if (t_perThreadReqArena == nullptr)
+    {
+        for (int i = 0; i < kPerThreadArenaCount; i++)
+        {
+            bool expected = false;
+            if (g_perThreadArenaClaimed[i].compare_exchange_strong(
+                    expected, true, std::memory_order_acq_rel))
+            {
+                t_perThreadReqArena = &g_perThreadArenas[i];
+                g_perThreadArenaInUseCount.fetch_add(1, std::memory_order_relaxed);
+                break;
+            }
+        }
+        if (t_perThreadReqArena == nullptr)
+        {
+            // Pool exhausted. Fall through with no arena — request bracket
+            // becomes a no-op for this thread; allocations route normally.
+            LOG1("simplegc_request_begin: per-thread arena pool exhausted");
+            return 0;
+        }
+    }
+
+    // Save bump position so request_end can rewind. Lock not required: only
+    // this thread ever touches its own slot's bump pointer.
+    t_perThreadCheckpoint = t_perThreadReqArena->bump;
+
+    t_activeArena = t_perThreadReqArena;
+
+    // Force the next allocation to refill from this slot by zeroing the
+    // cached alloc context's pointers. Without this, the runtime's fast
+    // path would keep bumping in whichever chunk perm gave us last.
     simplegc_flush_alloc_context(t_lastAllocCtx);
 
-    return (uint64_t)(uintptr_t)g_request.checkpoint;
+    return (uint64_t)(uintptr_t)t_perThreadCheckpoint;
 }
 
 GC_EXPORT
 uint64_t LOCALGC_CALLCONV
 simplegc_request_end()
 {
-    if (t_activeArena != &g_request)
+    if (t_activeArena == nullptr || t_activeArena != t_perThreadReqArena)
     {
-        LOG1("simplegc_request_end: no active request");
+        // Either no active request, or end was called on a thread that
+        // didn't call begin (e.g., async continuation hopped threads).
+        // Drop on the floor — the begin-thread will leak its slot's
+        // contents until its NEXT begin rewinds.
+        LOG1("simplegc_request_end: no active request on this thread");
         return 0;
     }
 
     uint64_t freedBytes = 0;
+    if (t_perThreadCheckpoint != nullptr && t_perThreadReqArena != nullptr)
     {
-        std::lock_guard<std::mutex> guard(g_request.lock);
-        freedBytes = (uint64_t)(g_request.bump - g_request.checkpoint);
-        // O(1) "collection": rewind bump pointer. All objects above are gone.
-        // DEBUG: optionally disable rewind to bisect arena-vs-rewind bugs.
+        freedBytes = (uint64_t)(t_perThreadReqArena->bump - t_perThreadCheckpoint);
+        // O(1) "collection": rewind THIS thread's bump pointer. All
+        // objects above the checkpoint in this slot are gone.
         static bool s_disableRewind = []() {
             const char* v = std::getenv("SIMPLEGC_NO_REWIND");
             return v != nullptr && v[0] == '1';
         }();
         if (!s_disableRewind)
         {
-            g_request.bump = g_request.checkpoint;
+            t_perThreadReqArena->bump = t_perThreadCheckpoint;
         }
     }
-    t_activeArena = nullptr;
 
-    // Flush the alloc context cache (combined_limit + alloc_ptr + alloc_limit)
-    // so the very next allocation falls into our slow-path Alloc. Without
-    // this, the runtime's fast path would keep bumping in the freshly-rewound
-    // region of the request arena and "allocate" into reclaimed memory.
+    t_activeArena = nullptr;
+    t_perThreadCheckpoint = nullptr;
+
+    // Flush the alloc context cache so the very next allocation falls into
+    // our slow-path Alloc and refills from a default-route arena. Without
+    // this, the runtime's fast path would keep bumping in the freshly-
+    // rewound region of the slot and "allocate" into reclaimed memory.
     simplegc_flush_alloc_context(t_lastAllocCtx);
 
     g_gcCount.fetch_add(1, std::memory_order_relaxed);
