@@ -24,6 +24,8 @@
 #include <atomic>
 #include <vector>
 #include <mutex>
+#include <condition_variable>
+#include <thread>
 #include <algorithm>
 #include <chrono>
 
@@ -986,6 +988,11 @@ static_assert(sizeof(SimpleGCStats) == 40, "SimpleGCStats ABI size mismatch");
 
 using ShouldCollectFn = int (LOCALGC_CALLCONV *)(const SimpleGCStats* stats);
 
+// Forward declaration: M1r.1 callback-dispatcher init. Defined at file
+// scope further down (next to the dispatcher thread main). Called from
+// simplegc_init_heap inside the anonymous namespace below.
+static void simplegc_init_dispatcher();
+
 namespace
 {
     std::atomic<ShouldCollectFn> g_shouldCollect{nullptr};
@@ -1437,6 +1444,12 @@ static bool simplegc_init_heap()
                                           std::memory_order_release);
         LOG1("auto-tune: auto_collect_mb=128 (uncapped fallback default)");
     }
+
+    // M1r.1: start the callback dispatcher thread. Parked on a condvar
+    // until a routing-policy callback is registered. Detached so it
+    // doesn't need explicit teardown — process exit kills it.
+    simplegc_init_dispatcher();
+
     return true;
 }
 
@@ -4143,6 +4156,27 @@ typedef void (LOCALGC_CALLCONV *RoutingPolicyFn)();
 
 static std::atomic<RoutingPolicyFn> g_routingPolicy{nullptr};
 
+// ---- M1r.1 dispatcher-thread state -------------------------------------
+//
+// The post-collect callback used to be invoked on whichever worker thread
+// tripped the auto-collect threshold; under Kestrel/Fortunes that thread
+// was a borrowed request handler in unrelated managed code, and the
+// callback corrupted JIT/reflection caches. The dispatcher thread fixes
+// this by isolating callback invocation from the alloc path.
+//
+// State accessed by simplegc_register_routing_policy / signal_callback /
+// set_callback_period_ms / dispatcher_thread_main. See the M1r.1 block
+// further down in this file for the dispatcher implementation.
+constexpr uint32_t kDispatcherDefaultPeriodMs = 250;
+
+static std::mutex                  g_dispatcherMutex;
+static std::condition_variable     g_dispatcherCv;
+static std::atomic<bool>           g_dispatcherWanted{false};
+static std::atomic<bool>           g_dispatcherShutdown{false};
+static std::atomic<uint32_t>       g_dispatcherPeriodMs{kDispatcherDefaultPeriodMs};
+static std::atomic<uint64_t>       g_dispatcherInvocations{0};
+static std::atomic<bool>           g_dispatcherStarted{false};
+
 GC_EXPORT
 uint32_t LOCALGC_CALLCONV
 simplegc_register_routing_policy(uint32_t abiVersion, RoutingPolicyFn cb)
@@ -4155,7 +4189,49 @@ simplegc_register_routing_policy(uint32_t abiVersion, RoutingPolicyFn cb)
     }
     g_routingPolicy.store(cb, std::memory_order_release);
     LOG1("simplegc_register_routing_policy: cb=%p", cb);
+    // Wake the dispatcher: when cb is non-null this transitions it from
+    // "no callback registered" sleep to periodic mode; when cb is null
+    // (unregister) it transitions back to indefinite sleep.
+    g_dispatcherCv.notify_one();
     return kRoutingPolicyAbiVersion;
+}
+
+// Explicitly request a callback invocation. Coalescing — multiple calls
+// before the dispatcher wakes collapse into a single callback invocation.
+// Used by managed code that wants tick-style adaptation without owning a
+// polling thread.
+GC_EXPORT
+void LOCALGC_CALLCONV
+simplegc_signal_callback()
+{
+    {
+        std::lock_guard<std::mutex> lk(g_dispatcherMutex);
+        g_dispatcherWanted.store(true, std::memory_order_relaxed);
+    }
+    g_dispatcherCv.notify_one();
+}
+
+// Set the dispatcher's periodic-tick interval (milliseconds). 0 resets
+// to the default (kDispatcherDefaultPeriodMs). The new period takes
+// effect on the next wait cycle; the dispatcher is woken so very long
+// in-flight waits don't block the change.
+GC_EXPORT
+void LOCALGC_CALLCONV
+simplegc_set_callback_period_ms(uint32_t periodMs)
+{
+    g_dispatcherPeriodMs.store(periodMs == 0 ? kDispatcherDefaultPeriodMs : periodMs,
+                               std::memory_order_release);
+    g_dispatcherCv.notify_one();
+}
+
+// Number of times the dispatcher has invoked the registered callback
+// since the substrate started. Useful for the managed side to verify
+// callbacks are firing as expected.
+GC_EXPORT
+uint64_t LOCALGC_CALLCONV
+simplegc_get_callback_invocations()
+{
+    return g_dispatcherInvocations.load(std::memory_order_relaxed);
 }
 
 // Fill `buffer` with up to `capacity` populated entries from the MT table.
@@ -4347,13 +4423,125 @@ simplegc_get_thread_route()
     return static_cast<int32_t>(t_forceRoute);
 }
 
-// Invoked at the end of simplegc_force_collect, AFTER RestartEE. The callback
-// runs in normal cooperative mode and may allocate / log freely.
+// ---------------------------------------------------------------------------
+// M1r.1 — callback dispatcher thread.
+//
+// History. The post-collect routing-policy callback used to be invoked
+// inline at the end of simplegc_force_collect, on whichever worker thread
+// tripped the auto-collect threshold. Under Kestrel/Fortunes that thread
+// was a borrowed request handler in the middle of unrelated managed code,
+// and the reverse-P/Invoke transition + any allocations the callback
+// performed (Dictionary inserts in the policy host, snapshot copies, ...)
+// corrupted JIT/reflection caches under load. M1q.1's AdaptivePolicy
+// sidestepped this by spawning its own managed polling thread and never
+// using the native callback at all.
+//
+// M1r.1 fixes the underlying problem so callbacks can become the primary
+// substrate for managed policy. A dedicated native dispatcher thread
+// parks on a condvar; force_collect (and explicit
+// simplegc_signal_callback() calls) only signal the condvar; the
+// dispatcher invokes the callback OFF the alloc path, on a thread that:
+//
+//   * has no Kestrel handler frames above it,
+//   * has no stale per-thread alloc context,
+//   * has no in-flight JIT compile state,
+//   * is not subject to the reentrancy hazard of running mid-Suspend/Restart.
+//
+// The dispatcher's wait is bounded (g_dispatcherPeriodMs, default 250 ms)
+// so callbacks also fire periodically without requiring a managed timer.
+// This subsumes the M1q.1 polling thread.
+//
+// Pay-for-play. When no policy is registered the dispatcher sleeps
+// indefinitely (no periodic wakes). simplegc_register_routing_policy()
+// notifies the condvar to transition the dispatcher into periodic mode.
+// Apps that never register pay nothing beyond a parked thread.
+//
+// Globals (g_dispatcherMutex / g_dispatcherCv / g_dispatcherWanted /
+// g_dispatcherShutdown / g_dispatcherPeriodMs / g_dispatcherInvocations
+// / g_dispatcherStarted) are declared next to g_routingPolicy further
+// up in this file.
+
+static void simplegc_dispatcher_thread_main()
+{
+    for (;;)
+    {
+        std::unique_lock<std::mutex> lk(g_dispatcherMutex);
+        if (g_dispatcherShutdown.load(std::memory_order_relaxed)) break;
+
+        RoutingPolicyFn cb = g_routingPolicy.load(std::memory_order_acquire);
+        if (cb == nullptr)
+        {
+            // No callback registered yet (or just unregistered). Sleep
+            // until someone registers one or asks for a signal — no
+            // periodic wakes so we don't spin while idle.
+            g_dispatcherCv.wait(lk, []{
+                return g_routingPolicy.load(std::memory_order_acquire) != nullptr
+                    || g_dispatcherShutdown.load(std::memory_order_relaxed)
+                    || g_dispatcherWanted.load(std::memory_order_relaxed);
+            });
+            continue;
+        }
+
+        // Callback is registered. Wait for either an explicit signal or
+        // the periodic timeout, whichever comes first.
+        uint32_t period = g_dispatcherPeriodMs.load(std::memory_order_relaxed);
+        if (period == 0) period = kDispatcherDefaultPeriodMs;
+        g_dispatcherCv.wait_for(lk, std::chrono::milliseconds(period),
+            []{
+                return g_dispatcherWanted.load(std::memory_order_relaxed)
+                    || g_dispatcherShutdown.load(std::memory_order_relaxed);
+            });
+        if (g_dispatcherShutdown.load(std::memory_order_relaxed)) break;
+        g_dispatcherWanted.store(false, std::memory_order_relaxed);
+        lk.unlock();
+
+        // Re-load cb outside the lock — the policy could have been
+        // unregistered between wait-wake and here. Invoke OUTSIDE the
+        // lock so the callback can re-signal (e.g. via
+        // simplegc_signal_callback) without self-deadlocking.
+        cb = g_routingPolicy.load(std::memory_order_acquire);
+        if (cb != nullptr)
+        {
+            g_dispatcherInvocations.fetch_add(1, std::memory_order_relaxed);
+            cb();
+        }
+    }
+}
+
+static void simplegc_init_dispatcher()
+{
+    bool expected = false;
+    if (!g_dispatcherStarted.compare_exchange_strong(expected, true,
+                                                     std::memory_order_acq_rel))
+    {
+        return;
+    }
+    try
+    {
+        std::thread t(simplegc_dispatcher_thread_main);
+        t.detach();
+        LOG1("simplegc: callback dispatcher started (period=%u ms)",
+             (unsigned)g_dispatcherPeriodMs.load(std::memory_order_relaxed));
+    }
+    catch (...)
+    {
+        // Thread spawn failure is non-fatal — the substrate is still
+        // functional; callbacks just won't fire. Logging only.
+        g_dispatcherStarted.store(false, std::memory_order_release);
+        LOG1("simplegc: callback dispatcher failed to start (callbacks disabled)");
+    }
+}
+
+// Invoked from simplegc_force_collect post-RestartEE. NEVER calls the
+// callback inline; just signals the dispatcher thread and returns.
 static void simplegc_invoke_routing_policy_post_collect()
 {
-    RoutingPolicyFn cb = g_routingPolicy.load(std::memory_order_acquire);
-    if (cb == nullptr) return;
-    cb();
+    if (g_routingPolicy.load(std::memory_order_acquire) == nullptr) return;
+    {
+        std::lock_guard<std::mutex> lk(g_dispatcherMutex);
+        g_dispatcherWanted.store(true, std::memory_order_relaxed);
+    }
+    g_dispatcherCv.notify_one();
 }
 
 // ---------------------------------------------------------------------------

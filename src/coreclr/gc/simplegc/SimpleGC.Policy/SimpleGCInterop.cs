@@ -110,6 +110,25 @@ public static class SimpleGCInterop
     /// O(1). Returns bytes freed by the rewind.</summary>
     [DllImport(Lib, EntryPoint = "simplegc_request_end")]
     public static extern ulong RequestEnd();
+
+    /// <summary>M1r.1: signal the dispatcher thread to invoke the
+    /// registered routing-policy callback as soon as it can. Coalesces
+    /// (multiple signals between callback invocations are collapsed to
+    /// one). Used by <c>force_collect</c> internally; can also be
+    /// called by managed code to request an immediate re-evaluation.</summary>
+    [DllImport(Lib, EntryPoint = "simplegc_signal_callback")]
+    public static extern void SignalCallback();
+
+    /// <summary>M1r.1: set the dispatcher's periodic wake interval in
+    /// milliseconds. Pass <c>0</c> to disable periodic invocation
+    /// (callback fires only on signals). Default is 250 ms.</summary>
+    [DllImport(Lib, EntryPoint = "simplegc_set_callback_period_ms")]
+    public static extern void SetCallbackPeriodMs(uint periodMs);
+
+    /// <summary>M1r.1: number of times the dispatcher has invoked the
+    /// registered routing-policy callback since process start.</summary>
+    [DllImport(Lib, EntryPoint = "simplegc_get_callback_invocations")]
+    public static extern ulong GetCallbackInvocations();
 }
 
 /// <summary>Mirror of the native <c>SimpleGCMarkSweepStats</c> ABI struct
