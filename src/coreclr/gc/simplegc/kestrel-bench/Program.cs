@@ -66,6 +66,19 @@ internal static class SimpleGC
     [DllImport("simplegc.dll", CallingConvention = CallingConvention.Cdecl)]
     private static extern ulong simplegc_get_promoted_mt_count();
 
+    [DllImport("simplegc.dll", CallingConvention = CallingConvention.Cdecl)]
+    private static extern uint simplegc_set_route(ulong mtToken, byte route);
+
+    [DllImport("simplegc.dll", CallingConvention = CallingConvention.Cdecl)]
+    private static extern void simplegc_enable_auto_route_default(int enable);
+
+    // Route values must match simplegc.cpp kRoute* constants.
+    public const byte RouteDefault    = 0;
+    public const byte RouteForcePerm  = 1;
+    public const byte RouteForceReq   = 2;
+    public const byte RouteMarkSweep  = 3;
+    public const byte RouteNoRefsPerm = 4;
+
     public static bool IsLoaded { get; }
     public static bool ArenaConfigured { get; }
 
@@ -113,6 +126,137 @@ internal static class SimpleGC
     }
 
     public static ulong PromotedMtCount() => IsLoaded ? simplegc_get_promoted_mt_count() : 0UL;
+
+    /// <summary>
+    /// M1q.0 — managed-policy startup seed. Pin a CLR type to a routing
+    /// decision so allocations of that exact type bypass the global default
+    /// route. Returns true if the MT was found in simplegc's per-MT table
+    /// (i.e. the type has been allocated at least once and the policy
+    /// touched it). When called before warmup, the type may not yet be
+    /// known — callers should re-seed after warmup if needed.
+    /// </summary>
+    public static bool SetRoute(Type type, byte route)
+    {
+        if (!IsLoaded || type is null) return false;
+        ulong mtToken = (ulong)type.TypeHandle.Value.ToInt64();
+        return simplegc_set_route(mtToken, route) != 0;
+    }
+
+    /// <summary>
+    /// Seed an entire list of types to ForcePerm. Returns (attempted, succeeded).
+    /// "Succeeded" means simplegc had an MT entry for the type at the time
+    /// of the call (i.e. it was already known). Types not yet known will
+    /// fall through to the global default until allocated, then any later
+    /// re-seed (or the M1p.0 native counter) catches them.
+    /// </summary>
+    public static (int attempted, int succeeded) SeedRoutes(IEnumerable<Type> types, byte route)
+    {
+        if (!IsLoaded) return (0, 0);
+        int att = 0, ok = 0;
+        foreach (var t in types)
+        {
+            att++;
+            if (SetRoute(t, route)) ok++;
+        }
+        return (att, ok);
+    }
+
+    /// <summary>M1q.0 — turn on process-wide auto-routing without setting
+    /// the M1p.0 native counter. The chunk-walker tallies bytes per route
+    /// and flips the thread's allocation flags when one route dominates.
+    /// Required for SetRoute decisions to actually steer allocations.</summary>
+    public static void EnableAutoRouteDefault(bool enable)
+    {
+        if (IsLoaded) simplegc_enable_auto_route_default(enable ? 1 : 0);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// M1q.0 — managed-policy startup seed list for Fortunes.
+//
+// This is the "managed half" of the customized-GC story: a hand-written
+// (or LLM-generated) list of types that *this app* allocates hot, which
+// the bench seeds into simplegc's per-MT routing table BEFORE serving
+// requests. Combined with SIMPLEGC_DEFAULT_ROUTE=marksweep, hot types
+// skip the bounded MS region entirely and land in perm.
+//
+// This is functionally equivalent to BasicPolicy (age >= 2 &&
+// survivedBytes >= 256) but applied statically at startup instead of
+// adaptively after each collect. The selection here is informed by the
+// per-MT survival snapshot captured in earlier OBSERVE-mode runs:
+//
+//   1   System.String        (276k allocs / 3.4 MB survived)
+//   2   System.Byte[]        (21k allocs / 0.7 MB survived)
+//   3   System.String[]      (10k allocs / 0.4 MB survived)
+//   4   System.Char[]        (20k allocs / 0.1 MB survived) - StringBuilder churn
+//   5   Fortune              (per-request transient, 13 per request)
+//   6   Fortune[]            (per-request render input)
+//   ... ASP.NET internals (RuntimeParameterInfo, RuntimeTypeCache, etc.)
+//       are intentionally NOT in the list — they are warmup-only and
+//       letting them sit in MS exercises the MS substrate too.
+//
+// Enable via env var: SIMPLEGC_USE_MANAGED_SEED=1.
+// ---------------------------------------------------------------------------
+
+internal static class ManagedSeed
+{
+    /// <summary>Types known to be hot in the Fortunes endpoint. The list
+    /// is intentionally short and explicit so the diff between "what the
+    /// app allocates" and "what we promote" is auditable.</summary>
+    public static readonly Type[] FortunesHotTypes = BuildFortunesHotTypes();
+
+    private static Type[] BuildFortunesHotTypes()
+    {
+        // RuntimeMethodInfo / RuntimeConstructorInfo are internal CLR types,
+        // so we can't reference them with typeof. Discover them at runtime
+        // via a representative MethodInfo / ConstructorInfo instance.
+        var runtimeMethodInfoType = typeof(string).GetMethod(nameof(string.ToString), Type.EmptyTypes)!.GetType();
+        var runtimeCtorInfoType   = typeof(object).GetConstructor(Type.EmptyTypes)!.GetType();
+
+        return new[]
+        {
+            // Core BCL hot types — surface in nearly every request via JSON,
+            // HTML rendering, and Pipe buffer churn.
+            typeof(string),
+            typeof(byte[]),
+            typeof(char[]),
+            typeof(string[]),
+            typeof(System.Text.StringBuilder),
+            typeof(int[]),
+            typeof(object),
+
+            // Bench-defined Fortunes types — the per-request allocation
+            // signature: 13 Fortune instances + a Fortune[] view.
+            typeof(Fortune),
+            typeof(Fortune[]),
+            typeof(System.Collections.Generic.List<Fortune>),
+
+            // Items / Search endpoint hot types (kept seeded so the same
+            // bench binary works across endpoints; harmless on Fortunes).
+            typeof(Item),
+            typeof(ItemsResponse),
+            typeof(Product),
+            typeof(ProductSummary),
+            typeof(ProductSummary[]),
+
+            // Reflection / DI / runtime internals that warm up during
+            // Kestrel + ASP.NET startup. These are not allocated per-request
+            // in steady state but they hit MS during warmup; without seeding
+            // them, the first collect fires before warmup ends. Identified
+            // from the OBSERVE-mode survival snapshot in the M1p.0 work.
+            runtimeMethodInfoType,
+            runtimeCtorInfoType,
+            typeof(System.Reflection.ParameterInfo),
+            typeof(System.Reflection.ParameterInfo[]),
+            typeof(Type[]),
+            typeof(Microsoft.Extensions.DependencyInjection.ServiceDescriptor),
+        };
+    }
+
+    public static (int attempted, int succeeded) SeedFortunes()
+    {
+        return SimpleGC.SeedRoutes(FortunesHotTypes, SimpleGC.RouteForcePerm);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1049,6 +1193,23 @@ internal static class Program
         using var host = Server.Build();
         await host.StartAsync();
         Console.WriteLine($"server started. catalog has {Catalog.Products.Length:N0} products.");
+
+        // M1q.0 — managed startup seed. When SIMPLEGC_USE_MANAGED_SEED=1
+        // is set, route a hand-picked list of hot types directly to perm
+        // BEFORE serving any request. This is the managed counterpart to
+        // M1p.0's native count-based promotion: the *decision* of which
+        // types to promote lives entirely in C# (see ManagedSeed.cs) so an
+        // LLM looking at the codebase could regenerate it for any app.
+        if (SimpleGC.IsLoaded)
+        {
+            string? seedEnv = Environment.GetEnvironmentVariable("SIMPLEGC_USE_MANAGED_SEED");
+            if (!string.IsNullOrEmpty(seedEnv) && seedEnv != "0")
+            {
+                SimpleGC.EnableAutoRouteDefault(true);
+                var (att, ok) = ManagedSeed.SeedFortunes();
+                Console.WriteLine($"  managed seed    : {ok}/{att} types pinned to perm (auto-routing ON)");
+            }
+        }
 
         try
         {

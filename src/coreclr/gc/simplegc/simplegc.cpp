@@ -4099,10 +4099,58 @@ simplegc_set_route(uint64_t mt_token, uint8_t route)
         }
         if (cur == nullptr)
         {
-            return 0;
+            // M1q.0: pre-seed support. If the MT is not yet in the table
+            // (i.e. nothing of this type has been allocated yet), claim
+            // the slot and write the route. This lets managed code seed
+            // routing decisions BEFORE any allocation happens — important
+            // for getting hot types to skip MS during warmup.
+            //
+            // Race: another thread may simultaneously be doing first-insert
+            // via mt_record. We CAS the slot atomically; if we win, we
+            // own the entry and write the route. If we lose, we re-check
+            // whether the winner was for our MT (in which case we update
+            // the route) or for a different MT (in which case we keep
+            // probing the next slot).
+            MethodTable* expected = nullptr;
+            if (e.mt.compare_exchange_strong(expected, mt,
+                    std::memory_order_acq_rel, std::memory_order_acquire))
+            {
+                // We own the new entry. Initialize counters to 0; mt_record
+                // on the next allocation will increment them.
+                e.count.store(0, std::memory_order_relaxed);
+                e.bytes.store(0, std::memory_order_relaxed);
+                e.min_size.store(UINT32_MAX, std::memory_order_relaxed);
+                e.max_size.store(0, std::memory_order_relaxed);
+                e.route.store(route, std::memory_order_release);
+                g_mtTableUsed.fetch_add(1, std::memory_order_relaxed);
+                return 1;
+            }
+            // CAS lost. Re-check: did the winner claim it for our MT?
+            if (expected == mt)
+            {
+                e.route.store(route, std::memory_order_release);
+                return 1;
+            }
+            // Winner claimed for a different MT — continue probing.
         }
     }
     return 0;
+}
+
+// M1q.0: process-wide flag mirroring SIMPLEGC_PROMOTE_AFTER_N_ALLOC's
+// auto-routing side-effect, exposed as a P/Invoke so a managed policy
+// can turn on auto-routing without using the native counter. Also
+// enables per-MT tracking, which is required for chunk-walks to tally
+// route bytes correctly.
+GC_EXPORT
+void LOCALGC_CALLCONV
+simplegc_enable_auto_route_default(int enable)
+{
+    g_autoRouteDefault.store(enable != 0 ? 1 : 0, std::memory_order_release);
+    if (enable != 0)
+    {
+        g_mtTrackingEnabled.store(1, std::memory_order_release);
+    }
 }
 
 GC_EXPORT
