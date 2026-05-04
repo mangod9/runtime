@@ -41,6 +41,7 @@ using Microsoft.Extensions.Logging;
 
 using SimpleGC.Policy;
 using SgcRoute = SimpleGC.Policy.Route;
+using SgcAdaptivePolicy = SimpleGC.Policy.AdaptivePolicy;
 using SgcRoutingEntry = SimpleGC.Policy.RoutingEntry;
 
 namespace SimpleGCKestrelBench;
@@ -1190,6 +1191,42 @@ internal static class Program
             }
         }
 
+        // M1q.1 — pay-for-play adaptive policy. When SIMPLEGC_USE_ADAPTIVE_POLICY=1
+        // is set, enable per-MT tracking and START the polling thread BEFORE
+        // host.Build() so promotions can take effect mid-build, before
+        // ASP.NET pipeline init has filled the mark-sweep cap.
+        SgcAdaptivePolicy? adaptive = null;
+        if (SimpleGC.IsLoaded)
+        {
+            string? adaptiveEnv = Environment.GetEnvironmentVariable("SIMPLEGC_USE_ADAPTIVE_POLICY");
+            if (!string.IsNullOrEmpty(adaptiveEnv) && adaptiveEnv != "0")
+            {
+                uint threshold = 128;
+                string? thrEnv = Environment.GetEnvironmentVariable("SIMPLEGC_ADAPTIVE_THRESHOLD");
+                if (!string.IsNullOrEmpty(thrEnv) && uint.TryParse(thrEnv, out uint t)) threshold = t;
+
+                int pollMs = 100;
+                string? pollEnv = Environment.GetEnvironmentVariable("SIMPLEGC_ADAPTIVE_POLL_MS");
+                if (!string.IsNullOrEmpty(pollEnv) && int.TryParse(pollEnv, out int pm) && pm > 0) pollMs = pm;
+
+                int maxSec = 15;
+                string? maxEnv = Environment.GetEnvironmentVariable("SIMPLEGC_ADAPTIVE_MAX_SEC");
+                if (!string.IsNullOrEmpty(maxEnv) && int.TryParse(maxEnv, out int ms) && ms > 0) maxSec = ms;
+
+                adaptive = SgcAdaptivePolicy.Start(new SgcAdaptivePolicy
+                {
+                    AllocCountThreshold        = threshold,
+                    PollInterval               = TimeSpan.FromMilliseconds(pollMs),
+                    MaxDuration                = TimeSpan.FromSeconds(maxSec),
+                    QuiescenceConsecutivePolls = 16,
+                    MinPollsBeforeStop         = 16,
+                    PromoteTo                  = SgcRoute.ForcePerm,
+                });
+                Console.WriteLine(
+                    $"  adaptive policy : ON (pre-Build start; threshold={threshold}, poll={pollMs}ms, max={maxSec}s)");
+            }
+        }
+
         using var host = Server.Build();
         await host.StartAsync();
         Console.WriteLine($"server started. catalog has {Catalog.Products.Length:N0} products.");
@@ -1215,6 +1252,16 @@ internal static class Program
         {
             int rv = await Driver.RunAsync(endpoint, totalRequests, concurrency);
 
+            if (adaptive is not null)
+            {
+                // Stop the polling thread (no-op if it self-stopped on
+                // quiescence) and emit final decision count.
+                int decisions = adaptive.DecisionsMade;
+                int polls     = adaptive.Polls;
+                adaptive.Dispose();
+                Console.WriteLine($"  adaptive policy : stopped (decisions={decisions} polls={polls})");
+            }
+
             if (observePolicy)
             {
                 DumpPolicySnapshot();
@@ -1224,6 +1271,7 @@ internal static class Program
         }
         finally
         {
+            adaptive?.Dispose();
             await host.StopAsync();
         }
     }

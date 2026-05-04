@@ -50,6 +50,14 @@ public static class SimpleGCInterop
     [DllImport(Lib, EntryPoint = "simplegc_enable_auto_routing")]
     public static extern void EnableAutoRouting(int enable);
 
+    /// <summary>Process-wide opt-in to chunk-boundary auto-routing. When ON,
+    /// every thread's chunk refill consults the per-MT routing table and may
+    /// flip the thread's <c>t_forceRoute</c> for the next chunk. Required for
+    /// <see cref="SetRoute"/> writes to actually steer future allocations.
+    /// Also implicitly enables MT tracking. Off by default.</summary>
+    [DllImport(Lib, EntryPoint = "simplegc_enable_auto_route_default")]
+    public static extern void EnableAutoRouteDefault(int enable);
+
     /// <summary>Force a mark-sweep collection. Returns the number of bytes
     /// reclaimed, or a negative error code.</summary>
     [DllImport(Lib, EntryPoint = "simplegc_collect_marksweep")]
