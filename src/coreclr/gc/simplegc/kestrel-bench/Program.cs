@@ -30,6 +30,7 @@ using System.Text;
 using System.Text.Encodings.Web;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Globalization;
 
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Hosting;
@@ -37,6 +38,10 @@ using Microsoft.AspNetCore.Server.Kestrel.Core;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+
+using SimpleGC.Policy;
+using SgcRoute = SimpleGC.Policy.Route;
+using SgcRoutingEntry = SimpleGC.Policy.RoutingEntry;
 
 namespace SimpleGCKestrelBench;
 
@@ -965,17 +970,134 @@ internal static class Program
         Console.WriteLine($"  mem-mb cap      : {(memMb > 0 ? memMb.ToString() + " MB" : "(unlimited)")}");
         Console.WriteLine($"  url             : {Server.Url}");
 
+        // M1n.2 diagnostic mode: enable per-MT tracking but DO NOT register
+        // the post-collect routing-policy callback. The callback re-enters
+        // managed code via a [UnmanagedCallersOnly] thunk on the same
+        // thread that triggered the collect, which (empirically) corrupts
+        // the runtime's reflection / JIT caches mid-traffic and produces
+        // "Invalid Program: attempted to call a UnmanagedCallersOnly
+        // method from managed code" on subsequent JIT'd code paths
+        // (HttpClient ConcurrentStack.Push, DI factory, etc.). Until that
+        // re-entrancy is solved, we only OBSERVE per-MT survival data and
+        // dump a snapshot at end-of-run, which lets us answer the
+        // diagnostic question "what would BasicPolicy promote?" without
+        // actually firing the policy callback.
+        //
+        // Enable with env SIMPLEGC_USE_POLICY=1.
+        bool observePolicy = false;
+        if (SimpleGC.IsLoaded)
+        {
+            string? policyEnv = Environment.GetEnvironmentVariable("SIMPLEGC_USE_POLICY");
+            if (!string.IsNullOrEmpty(policyEnv) && policyEnv != "0")
+            {
+                observePolicy = true;
+                SimpleGCInterop.EnableMtTracking(1);
+                Console.WriteLine($"  policy host     : OBSERVE (per-MT tracking ON, callback OFF; will dump snapshot at end)");
+            }
+            else
+            {
+                Console.WriteLine("  policy host     : OFF (set SIMPLEGC_USE_POLICY=1 to enable observe mode)");
+            }
+        }
+
         using var host = Server.Build();
         await host.StartAsync();
         Console.WriteLine($"server started. catalog has {Catalog.Products.Length:N0} products.");
 
         try
         {
-            return await Driver.RunAsync(endpoint, totalRequests, concurrency);
+            int rv = await Driver.RunAsync(endpoint, totalRequests, concurrency);
+
+            if (observePolicy)
+            {
+                DumpPolicySnapshot();
+            }
+
+            return rv;
         }
         finally
         {
             await host.StopAsync();
+        }
+    }
+
+    private static unsafe void DumpPolicySnapshot()
+    {
+        const int Capacity = 4096;
+        var buffer = new SgcRoutingEntry[Capacity];
+        uint emitted;
+        fixed (SgcRoutingEntry* p = buffer)
+        {
+            emitted = SimpleGCInterop.GetRoutingSnapshot(p, Capacity);
+        }
+        int valid = (int)Math.Min(emitted, (uint)Capacity);
+        Console.WriteLine();
+        Console.WriteLine("=== per-MT survival snapshot (top 30 by survived_bytes) ===");
+        Console.WriteLine($"  total tracked MTs    : {emitted}{(emitted > Capacity ? " (truncated)" : "")}");
+        if (valid == 0)
+        {
+            Console.WriteLine("  (no rows — no mark-sweep collection has observed any survivors)");
+            return;
+        }
+
+        // Sort by survived_bytes descending.
+        Array.Sort(buffer, 0, valid, Comparer<SgcRoutingEntry>.Create(
+            (a, b) => b.SurvivedBytes.CompareTo(a.SurvivedBytes)));
+
+        // BasicPolicy.AgeThreshold = 2, MinSurvivedBytes = 256
+        const uint BasicAgeThreshold = 2;
+        const ulong BasicMinSurvived = 256;
+
+        Console.WriteLine(
+            "  rank  age  alloc_count   alloc_KB  survived_count survived_KB  size  type");
+        int wouldPromote = 0;
+        for (int i = 0; i < Math.Min(valid, 30); i++)
+        {
+            var e = buffer[i];
+            string typeName = TryGetMtName(e.MtToken);
+            bool meetsBasic = e.AgeCollections >= BasicAgeThreshold && e.SurvivedBytes >= BasicMinSurvived;
+            if (meetsBasic) wouldPromote++;
+            Console.WriteLine(string.Format(CultureInfo.InvariantCulture,
+                "  {0,4}  {1,3}  {2,11}  {3,9:F1}  {4,14}  {5,10:F1}  {6,4}  {7}{8}",
+                i + 1,
+                e.AgeCollections,
+                e.AllocCount,
+                e.AllocBytes / 1024.0,
+                e.SurvivedCount,
+                e.SurvivedBytes / 1024.0,
+                e.MinSize == e.MaxSize ? e.MinSize.ToString() : $"{e.MinSize}-{e.MaxSize}",
+                typeName,
+                meetsBasic ? "  <- BasicPolicy would promote" : ""));
+        }
+
+        // Also count BasicPolicy-promote candidates across the whole table.
+        int totalCandidates = 0;
+        ulong totalCandidateBytes = 0;
+        for (int i = 0; i < valid; i++)
+        {
+            var e = buffer[i];
+            if (e.AgeCollections >= BasicAgeThreshold && e.SurvivedBytes >= BasicMinSurvived)
+            {
+                totalCandidates++;
+                totalCandidateBytes += e.SurvivedBytes;
+            }
+        }
+        Console.WriteLine(string.Format(CultureInfo.InvariantCulture,
+            "  BasicPolicy candidates (age>=2 && survivedBytes>=256): {0} types, {1:F1} KB total",
+            totalCandidates, totalCandidateBytes / 1024.0));
+    }
+
+    private static string TryGetMtName(ulong mtToken)
+    {
+        try
+        {
+            var handle = RuntimeTypeHandle.FromIntPtr((IntPtr)(long)mtToken);
+            var type = Type.GetTypeFromHandle(handle);
+            return type?.FullName ?? "(unknown)";
+        }
+        catch
+        {
+            return "(invalid handle)";
         }
     }
 }

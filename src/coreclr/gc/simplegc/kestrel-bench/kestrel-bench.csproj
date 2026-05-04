@@ -15,4 +15,8 @@
     <InvariantGlobalization>true</InvariantGlobalization>
   </PropertyGroup>
 
+  <ItemGroup>
+    <ProjectReference Include="..\SimpleGC.Policy\SimpleGC.Policy.csproj" />
+  </ItemGroup>
+
 </Project>
