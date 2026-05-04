@@ -101,7 +101,12 @@ namespace
     constexpr size_t kRequestSize    = 256  * 1024 * 1024;  // 256 MB
     constexpr size_t kMarkSweepSize  = 256  * 1024 * 1024;  // 256 MB
     constexpr size_t kNoRefsPermSize = 1024 * 1024 * 1024;  // 1 GB (M1g)
-    constexpr size_t kHeapSize       = kPermSize + kRequestSize + kMarkSweepSize + kNoRefsPermSize;
+    // M1o.0a: gen0 nursery region. Reserved (not committed) up front; commit
+    // grows on demand the same way perm/request grow. Only meaningful when
+    // SIMPLEGC_DEFAULT_ROUTE=gen0 is set; otherwise the region sits idle
+    // (cost = 64 MB of reserved, uncommitted address space).
+    constexpr size_t kGen0Size       = 64   * 1024 * 1024;  // 64 MB (M1o)
+    constexpr size_t kHeapSize       = kPermSize + kRequestSize + kMarkSweepSize + kNoRefsPermSize + kGen0Size;
     // M1h: smaller commit grain so simplegc can fit under tight Job
     // Object memory caps. Was 16 MB — reducing to 1 MB lets the substrate
     // demonstrate graceful operation under ~64-96 MB process memory caps
@@ -215,6 +220,21 @@ namespace
     // "segregated no-refs perm" optimization: ref-free types promoted by
     // the policy land here and pay zero scan cost per collection.
     Arena g_norefsPerm;
+
+    // M1o.0a: gen0 nursery arena. Active only when SIMPLEGC_DEFAULT_ROUTE=gen0.
+    // Until M1o.0b adds gen0_collect, gen0 fills monotonically and overflows
+    // back to MS — the arena exists to validate the routing plumbing without
+    // any correctness risk from a half-implemented copy collector.
+    Arena g_gen0;
+
+    // M1o.0a: counters for gen0 alloc (overflow + raw allocs). Used to
+    // verify routing actually targets gen0 and to measure how often
+    // overflow-to-MS fires once gen0 fills (which it will in M1o.0a since
+    // collect isn't wired yet).
+    std::atomic<uint64_t> g_gen0AllocCount{0};
+    std::atomic<uint64_t> g_gen0AllocBytes{0};
+    std::atomic<uint64_t> g_gen0OverflowToMsCount{0};
+    std::atomic<uint64_t> g_gen0OverflowToMsBytes{0};
 
     // ---- M1b: mark-sweep region ---------------------------------------------
     //
@@ -367,7 +387,8 @@ namespace
         return (p >= g_perm.start       && p < g_perm.end)
             || (p >= g_request.start    && p < g_request.end)
             || (p >= g_norefsPerm.start && p < g_norefsPerm.end)
-            || (p >= g_marksweep.start_obj && p < g_marksweep.end);
+            || (p >= g_marksweep.start_obj && p < g_marksweep.end)
+            || (p >= g_gen0.start       && p < g_gen0.end);
     }
 
     // Write a g_gc_pFreeObjectMethodTable filler covering the abandoned tail
@@ -550,6 +571,7 @@ namespace
     constexpr uint8_t kRouteForceReq    = 2;
     constexpr uint8_t kRouteMarkSweep   = 3;
     constexpr uint8_t kRouteNoRefsPerm  = 4;  // M1g: ref-free perm arena; not scanned
+    constexpr uint8_t kRouteGen0        = 5;  // M1o.0a: gen0 nursery (overflows to MS until .0b)
 
     SimpleGCMTEntry        g_mtTable[kMtTableCapacity];
     std::atomic<uint64_t>  g_mtAttributedObjects{0};
@@ -975,6 +997,23 @@ static bool simplegc_init_heap()
     }
     g_norefsPerm.committed = g_norefsPerm.start + ((kStartPadding + 4095) & ~static_cast<size_t>(4095));
 
+    // M1o.0a: gen0 nursery — fifth sub-range. Bump-allocator semantics
+    // (same as g_perm); when SIMPLEGC_DEFAULT_ROUTE=gen0 is set, default
+    // allocations land here. Until M1o.0b adds gen0_collect, gen0 fills
+    // monotonically and the alloc path overflows to MS once g_gen0.bump
+    // can no longer satisfy a chunk.
+    uint8_t* gen0Base = nrpBase + kNoRefsPermSize;
+    g_gen0.start     = gen0Base;
+    g_gen0.end       = gen0Base + kGen0Size;
+    g_gen0.committed = g_gen0.start;
+    g_gen0.bump      = g_gen0.start + kStartPadding;
+    if (!GCToOSInterface::VirtualCommit(g_gen0.start, kStartPadding))
+    {
+        LOG1("VirtualCommit(gen0 start padding) failed");
+        return false;
+    }
+    g_gen0.committed = g_gen0.start + ((kStartPadding + 4095) & ~static_cast<size_t>(4095));
+
     // Side bitmap: 1 bit per kMarkBitGranularity bytes of the data area. We
     // size it for the FULL reserve so we never need to grow it.
     g_marksweep.mark_bits_size =
@@ -1020,8 +1059,8 @@ static bool simplegc_init_heap()
     }
 #endif
 
-    LOG1("heap reserved at %p .. %p (perm=%zu MB, request=%zu MB, marksweep=%zu MB, norefsperm=%zu MB)",
-         g_heapStart, g_heapEnd, kPermSize >> 20, kRequestSize >> 20, kMarkSweepSize >> 20, kNoRefsPermSize >> 20);
+    LOG1("heap reserved at %p .. %p (perm=%zu MB, request=%zu MB, marksweep=%zu MB, norefsperm=%zu MB, gen0=%zu MB)",
+         g_heapStart, g_heapEnd, kPermSize >> 20, kRequestSize >> 20, kMarkSweepSize >> 20, kNoRefsPermSize >> 20, kGen0Size >> 20);
 
     // ---- M1j.3: env-driven cap-aware policy ----
     // SIMPLEGC_AUTO_COLLECT_MB=N
@@ -1054,6 +1093,16 @@ static bool simplegc_init_heap()
             g_defaultRoute.store(kRouteMarkSweep, std::memory_order_release);
             defaultRouteUserSet = true;
             LOG1("SIMPLEGC_DEFAULT_ROUTE=marksweep");
+        }
+        else if (std::strcmp(v, "gen0") == 0)
+        {
+            // M1o.0a: route default allocations to the gen0 nursery.
+            // Until M1o.0b wires gen0_collect, allocs fill gen0 and
+            // overflow to MS — same throughput shape as plain MS but
+            // exercises the gen0 plumbing so we can validate it.
+            g_defaultRoute.store(kRouteGen0, std::memory_order_release);
+            defaultRouteUserSet = true;
+            LOG1("SIMPLEGC_DEFAULT_ROUTE=gen0");
         }
     }
     // M1l measure: SIMPLEGC_CHUNK_KB tunes the MS chunk-take size.
@@ -2601,6 +2650,73 @@ public:
             effRoute = (globalDef != kRouteDefault) ? globalDef : kRouteForcePerm;
         }
 
+        if (effRoute == kRouteGen0)
+        {
+            // M1o.0a: gen0 nursery alloc. Same chunk-take shape as the perm
+            // path below (g_gen0 is a bump arena like g_perm/g_request) but
+            // targets g_gen0. Until M1o.0b adds gen0_collect, gen0 fills
+            // monotonically and we fall back to MS by setting effRoute =
+            // kRouteMarkSweep when simplegc_raw_alloc returns null. This
+            // exercises the routing without any correctness risk from a
+            // half-implemented evacuator.
+            //
+            // Slack convention matches the perm/request/MS chunks so that
+            // arena_fill_chunk_tail can always encode an abandoned tail as a
+            // g_gc_pFreeObjectMethodTable filler — required by the
+            // bumpable_arena_range walker once we wire gen0 into the cross
+            // region scan in M1o.0c.
+            size_t baseChunkSize = (size > kAllocCtxQuant) ? size : kAllocCtxQuant;
+            size_t slack         = arena_fill_slack();
+            size_t chunkSize     = baseChunkSize + slack;
+            uint8_t* chunk = simplegc_raw_alloc(g_gen0, chunkSize);
+            if (chunk != nullptr)
+            {
+                // Fresh memory from VirtualCommit is zero-initialized. Until
+                // M1o.0f wires gen0 reset (which reuses already-committed
+                // bytes), we don't need to memset here. The MS path memsets
+                // because its memory may be stale freelist content; gen0 will
+                // need the same once collect lands.
+                Object* obj = reinterpret_cast<Object*>(chunk);
+                g_requestedBytes.fetch_add(size, std::memory_order_relaxed);
+                g_gen0AllocCount.fetch_add(1, std::memory_order_relaxed);
+                g_gen0AllocBytes.fetch_add(baseChunkSize, std::memory_order_relaxed);
+                // Note: simplegc_raw_alloc already bumped g_objectCount and
+                // g_totalAllocated, so no need to repeat them here.
+                if (acontext != nullptr)
+                {
+                    t_lastAllocCtx = acontext;
+                    acontext->alloc_ptr   = chunk + size;
+                    acontext->alloc_limit = chunk + baseChunkSize;
+                    acontext->alloc_bytes += (int64_t)size;
+                    // Per-MT attribution machinery walks [t_chunkStart,
+                    // alloc_ptr) on the next slow-path call. This works
+                    // identically across arenas; gen0 allocs flow into the
+                    // same MT counters used for routing decisions.
+                    t_chunkStart = chunk;
+                    t_chunkEnd   = chunk + baseChunkSize;
+                }
+                static int s_gen0TraceCount = 0;
+                if (s_gen0TraceCount++ < 10)
+                {
+                    LOG1("Alloc[gen0 %d] size=%zu flags=0x%x -> %p (acontext=%p)",
+                         s_gen0TraceCount, size, flags, chunk, acontext);
+                }
+                return obj;
+            }
+            // Gen0 full. Fall back to MS by re-routing this allocation.
+            // Increment overflow counters so the post-run summary shows how
+            // much pressure gen0 took before saturating; once M1o.0b wires
+            // collect, this counter should drop toward zero in steady state.
+            g_gen0OverflowToMsCount.fetch_add(1, std::memory_order_relaxed);
+            g_gen0OverflowToMsBytes.fetch_add(size, std::memory_order_relaxed);
+            static int s_overflowOnce = 0;
+            if (s_overflowOnce++ == 0)
+            {
+                LOG1("Alloc[gen0]: gen0 full — falling back to MS for size=%zu", size);
+            }
+            effRoute = kRouteMarkSweep;
+        }
+
         if (effRoute == kRouteMarkSweep)
         {
             // M1k.1: chunk-based MS allocation (TLAB-style).
@@ -3157,6 +3273,13 @@ HRESULT simplegc_force_collect()
             // cards are sticky but whose source is below permWalkedHigh).
             ms_walk_arena_card_aware(g_perm);
             ms_walk_arena_card_aware(g_request);
+            // M1o.0a: gen0 holds live objects too; their refs into MS must
+            // be discovered during MS collect or MS would sweep targets
+            // referenced only from gen0. M1o.0c will replace this
+            // conservative walk with the gen0 evacuator (which moves all
+            // gen0 objects to MS, leaving gen0 empty before MS collect).
+            // Until then, conservatively walk gen0 for cross-region refs.
+            if (g_gen0.bump > g_gen0.start) ms_walk_arena_card_aware(g_gen0);
         }
         else
         {
@@ -3164,6 +3287,8 @@ HRESULT simplegc_force_collect()
             uint8_t* requestWalkStart = g_permImmutableOptIn ? g_requestWalkedHigh : nullptr;
             ms_walk_arena_for_external_refs(g_perm,    permWalkStart);
             ms_walk_arena_for_external_refs(g_request, requestWalkStart);
+            // M1o.0a: see comment above for the cards branch.
+            if (g_gen0.bump > g_gen0.start) ms_walk_arena_for_external_refs(g_gen0, nullptr);
         }
         if (g_permImmutableOptIn)
         {
