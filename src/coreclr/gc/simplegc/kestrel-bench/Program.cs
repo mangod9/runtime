@@ -63,6 +63,9 @@ internal static class SimpleGC
         out ulong consults, out ulong approved, out ulong gcs,
         out ulong totalAlloc, out ulong requested, out ulong objects);
 
+    [DllImport("simplegc.dll", CallingConvention = CallingConvention.Cdecl)]
+    private static extern ulong simplegc_get_promoted_mt_count();
+
     public static bool IsLoaded { get; }
     public static bool ArenaConfigured { get; }
 
@@ -108,6 +111,8 @@ internal static class SimpleGC
         simplegc_get_telemetry(out var c, out var a, out var g, out var t, out var r, out var o);
         return (c, a, g, t, r, o);
     }
+
+    public static ulong PromotedMtCount() => IsLoaded ? simplegc_get_promoted_mt_count() : 0UL;
 }
 
 // ---------------------------------------------------------------------------
@@ -845,6 +850,7 @@ internal static class Driver
         {
             var t = SimpleGC.Telemetry();
             var a = SimpleGC.ArenaStats();
+            ulong promotedMts = SimpleGC.PromotedMtCount();
             Console.WriteLine();
             Console.WriteLine("=== simplegc telemetry ===");
             Console.WriteLine($"  gcCount  : {t.gcs}");
@@ -852,6 +858,10 @@ internal static class Driver
             Console.WriteLine($"  requested : {t.requested / 1024.0 / 1024.0,10:F1} MB");
             Console.WriteLine($"  perm used : {a.pu / 1024.0 / 1024.0,10:F1} MB / committed {a.pc / 1024.0 / 1024.0,8:F1} MB");
             Console.WriteLine($"  req  used : {a.ru / 1024.0 / 1024.0,10:F1} MB / committed {a.rc / 1024.0 / 1024.0,8:F1} MB");
+            if (promotedMts > 0)
+            {
+                Console.WriteLine($"  promotedMTs: {promotedMts} (auto-promoted to perm by SIMPLEGC_PROMOTE_AFTER_N_ALLOC)");
+            }
         }
 
         return failures == 0 ? 0 : 2;

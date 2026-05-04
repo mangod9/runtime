@@ -483,6 +483,35 @@ namespace
     std::atomic<uint64_t> g_autoCollectCount{0};
     constexpr uint64_t kAutoCollectThrottleBytes = 16 * 1024 * 1024; // 16 MB
 
+    // ---- M1p.0: aggressive promote-to-perm policy --------------------------
+    //
+    // When SIMPLEGC_PROMOTE_AFTER_N_ALLOC=N is set, an MT whose cumulative
+    // allocation count crosses N has its per-MT route flipped from default
+    // to kRouteForcePerm. The thread-local auto-routing path picks this up
+    // on the next chunk-walk and switches the thread to perm allocations
+    // for that workload. Combined with SIMPLEGC_DEFAULT_ROUTE=marksweep, the
+    // effect is: hot MTs migrate to perm fast, MS only holds the long tail
+    // of rarely-allocated MTs, sweeps stay cheap because the surviving MS
+    // graph stays small.
+    //
+    // Why this is the "Path B" alternative to gen0:
+    //   gen0 buys cheap collects by walking only a small region of recent
+    //   allocs. Promotion-to-perm achieves the same end (small MS graph)
+    //   without copy/forwarding/cards/interior-pointers — at the cost of
+    //   higher peak working set, since promoted MTs are never reclaimed.
+    //   Acceptable for steady-state services where the routing decision
+    //   stabilizes after warmup.
+    //
+    // 0 = disabled (default).
+    std::atomic<uint64_t> g_promoteAfterNAlloc{0};
+    std::atomic<uint64_t> g_promotedMtCount{0};
+
+    // When non-zero, every thread behaves as if simplegc_enable_auto_routing(1)
+    // had been called. Set automatically by init when SIMPLEGC_PROMOTE_AFTER_N_ALLOC
+    // is configured, since the promotion writes the route on the MT entry but
+    // the per-thread tally walker has to be running to actually act on it.
+    std::atomic<int> g_autoRouteDefault{0};
+
     // M1l measure: per-phase timing accumulators (microseconds). Updated by
     // simplegc_force_collect so we can quantify where collect time is spent
     // (perm scan vs sweep vs root scan) before deciding which substrate to
@@ -652,7 +681,7 @@ namespace
             MethodTable* cur = e.mt.load(std::memory_order_acquire);
             if (cur == mt)
             {
-                e.count.fetch_add(1, std::memory_order_relaxed);
+                uint64_t newCount = e.count.fetch_add(1, std::memory_order_relaxed) + 1;
                 e.bytes.fetch_add(size, std::memory_order_relaxed);
                 uint32_t mn = e.min_size.load(std::memory_order_relaxed);
                 while (size < mn &&
@@ -660,6 +689,25 @@ namespace
                 uint32_t mx = e.max_size.load(std::memory_order_relaxed);
                 while (size > mx &&
                        !e.max_size.compare_exchange_weak(mx, size, std::memory_order_relaxed)) {}
+
+                // M1p.0 promote-to-perm: when this MT's count crosses the
+                // configured threshold, atomically flip its route from the
+                // default to kRouteForcePerm. Only the thread that observes
+                // the cross gets to do the CAS; subsequent threads see the
+                // updated route and skip. The flip is one-way (default →
+                // forcePerm); managed-side simplegc_set_route can still
+                // override later if a policy explicitly resets it.
+                uint64_t threshold = g_promoteAfterNAlloc.load(std::memory_order_relaxed);
+                if (threshold != 0 && newCount == threshold)
+                {
+                    uint8_t expected = kRouteDefault;
+                    if (e.route.compare_exchange_strong(expected, kRouteForcePerm,
+                            std::memory_order_acq_rel, std::memory_order_relaxed))
+                    {
+                        g_promotedMtCount.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+
                 uint8_t r = e.route.load(std::memory_order_relaxed);
                 if (r < 5) t_routeTally[r] += size;
                 return;
@@ -681,8 +729,20 @@ namespace
                 }
                 if (expected == mt)
                 {
-                    e.count.fetch_add(1, std::memory_order_relaxed);
+                    uint64_t newCount = e.count.fetch_add(1, std::memory_order_relaxed) + 1;
                     e.bytes.fetch_add(size, std::memory_order_relaxed);
+                    // Mirror the M1p.0 promotion check from the cur==mt branch
+                    // so the threshold can also fire in the racy first-insert path.
+                    uint64_t threshold = g_promoteAfterNAlloc.load(std::memory_order_relaxed);
+                    if (threshold != 0 && newCount == threshold)
+                    {
+                        uint8_t expectedR = kRouteDefault;
+                        if (e.route.compare_exchange_strong(expectedR, kRouteForcePerm,
+                                std::memory_order_acq_rel, std::memory_order_relaxed))
+                        {
+                            g_promotedMtCount.fetch_add(1, std::memory_order_relaxed);
+                        }
+                    }
                     uint8_t r = e.route.load(std::memory_order_relaxed);
                     if (r < 5) t_routeTally[r] += size;
                     return;
@@ -812,7 +872,11 @@ namespace
                 // Auto-routing: if the dominant route in the just-walked
                 // chunk is non-default and accounts for >= 60% of attributed
                 // bytes, flip the thread's routing flags for the next chunk.
-                if (t_autoRoute)
+                // M1p.0: g_autoRouteDefault makes this on-by-default for all
+                // threads when SIMPLEGC_PROMOTE_AFTER_N_ALLOC is configured,
+                // so the promotion writes (which mutate per-MT route entries)
+                // actually take effect at allocation time.
+                if (t_autoRoute || g_autoRouteDefault.load(std::memory_order_relaxed) != 0)
                 {
                     uint64_t total = t_routeTally[0] + t_routeTally[1] +
                                      t_routeTally[2] + t_routeTally[3] +
@@ -833,6 +897,20 @@ namespace
                         // Threshold: 60% of total bytes.
                         if (bestB * 5 >= total * 3)
                         {
+                            // Always reset the high-priority t_forceRoute so
+                            // a previous chunk's "force perm" decision doesn't
+                            // bleed into a chunk where MS dominates again.
+                            // The case bodies below set it back if needed.
+                            //
+                            // M1p.0 fix: when promotion routes a hot MT to
+                            // kRouteForcePerm, we need the thread to actually
+                            // bypass globalDef==kRouteMarkSweep — setting
+                            // t_useMarkSweep=false is not enough because the
+                            // dispatch path falls through to globalDef. Use
+                            // t_forceRoute (which has higher priority than
+                            // globalDef in the dispatch ladder) to make the
+                            // override stick.
+                            t_forceRoute = kRouteDefault;
                             switch (best)
                             {
                             case kRouteMarkSweep:
@@ -841,6 +919,7 @@ namespace
                             case kRouteForcePerm:
                                 t_useMarkSweep = false;
                                 t_activeArena  = nullptr; // perm
+                                t_forceRoute   = kRouteForcePerm;
                                 break;
                             case kRouteForceReq:
                                 t_useMarkSweep = false;
@@ -1119,6 +1198,31 @@ static bool simplegc_init_heap()
             g_defaultRoute.store(kRouteGen0, std::memory_order_release);
             defaultRouteUserSet = true;
             LOG1("SIMPLEGC_DEFAULT_ROUTE=gen0");
+        }
+    }
+    // M1p.0: SIMPLEGC_PROMOTE_AFTER_N_ALLOC=N — once an MT's cumulative
+    // alloc count crosses N, flip its per-MT route from default to perm.
+    // Combined with SIMPLEGC_DEFAULT_ROUTE=marksweep this gives a
+    // self-tuning "hot MTs go to perm, cold/long-tail stays in MS"
+    // policy without any managed callback. Auto-routing is enabled
+    // process-wide so threads pick up the route flips.
+    if (const char* v = std::getenv("SIMPLEGC_PROMOTE_AFTER_N_ALLOC"))
+    {
+        if (*v != '\0')
+        {
+            uint64_t n = std::strtoull(v, nullptr, 10);
+            if (n > 0)
+            {
+                g_promoteAfterNAlloc.store(n, std::memory_order_release);
+                g_autoRouteDefault.store(1, std::memory_order_release);
+                // Per-MT tracking must be on for the promote path's
+                // count.fetch_add to fire. Mirror the kestrel-bench
+                // convention where USE_POLICY enables tracking; here we
+                // enable it unconditionally so the env var "just works".
+                g_mtTrackingEnabled.store(1, std::memory_order_release);
+                LOG1("SIMPLEGC_PROMOTE_AFTER_N_ALLOC=%llu (auto-route + mt-tracking enabled)",
+                     (unsigned long long)n);
+            }
         }
     }
     // M1o.0b: SIMPLEGC_SHADOW_GEN0_SCAN_RUNS=N — at the start of the next
@@ -3595,6 +3699,16 @@ simplegc_get_telemetry(uint64_t* outConsultCount,
     if (outTotalAllocatedBytes!= nullptr) *outTotalAllocatedBytes= g_totalAllocated.load(std::memory_order_relaxed);
     if (outRequestedBytes     != nullptr) *outRequestedBytes     = g_requestedBytes.load(std::memory_order_relaxed);
     if (outObjectCount        != nullptr) *outObjectCount        = g_objectCount.load(std::memory_order_relaxed);
+}
+
+// M1p.0: cumulative number of MTs that have been auto-promoted to perm by
+// SIMPLEGC_PROMOTE_AFTER_N_ALLOC. 0 when the env var is unset or no MT has
+// reached the threshold.
+GC_EXPORT
+uint64_t LOCALGC_CALLCONV
+simplegc_get_promoted_mt_count()
+{
+    return g_promotedMtCount.load(std::memory_order_relaxed);
 }
 
 // ---------------------------------------------------------------------------
