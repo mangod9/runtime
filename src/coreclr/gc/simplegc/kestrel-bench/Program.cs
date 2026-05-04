@@ -312,11 +312,54 @@ internal static class ManagedSeed
         return SimpleGC.SeedRoutes(FortunesHotTypes, SimpleGC.RouteForcePerm);
     }
 
+    /// <summary>M1r.5 diagnostic: a strict subset of <see cref="BaseHotTypes"/>
+    /// containing ONLY warmup-only / truly-immortal types. Per-request
+    /// churn types (string, byte[], char[], string[], StringBuilder, int[],
+    /// object) are excluded — these would otherwise grow perm monotonically
+    /// in a request-cycling app since perm has no compaction or decommit.
+    /// Used when SIMPLEGC_MINIMAL_SEED=1 to test how much of the perm-pool
+    /// peakWS gap vs WKS is policy-side (over-aggressive seeding) vs
+    /// substrate-side (perm has no reclaim path).</summary>
+    public static readonly Type[] MinimalImmortalTypes = BuildMinimalImmortalTypes();
+
+    private static Type[] BuildMinimalImmortalTypes()
+    {
+        // Reflection internals; these are populated during Kestrel + ASP.NET
+        // startup and stay alive for the process lifetime. They do not
+        // cycle per request.
+        var runtimeMethodInfoType = typeof(string).GetMethod(nameof(string.ToString), Type.EmptyTypes)!.GetType();
+        var runtimeCtorInfoType   = typeof(object).GetConstructor(Type.EmptyTypes)!.GetType();
+
+        return new[]
+        {
+            runtimeMethodInfoType,
+            runtimeCtorInfoType,
+            typeof(System.Reflection.ParameterInfo),
+            typeof(System.Reflection.ParameterInfo[]),
+            typeof(Type[]),
+            typeof(Microsoft.Extensions.DependencyInjection.ServiceDescriptor),
+        };
+    }
+
     /// <summary>M1q.2 — seed only the types this app actually needs.
     /// Composes <see cref="BaseHotTypes"/> with the endpoint-specific
-    /// list. Returns (attempted, succeeded, endpointName).</summary>
+    /// list. Returns (attempted, succeeded, endpointName).
+    ///
+    /// M1r.5: when SIMPLEGC_MINIMAL_SEED=1, uses <see cref="MinimalImmortalTypes"/>
+    /// in place of BaseHotTypes and skips endpoint-specific types — the
+    /// per-request churn is left unrouted (flows to MS, gets swept,
+    /// freelist gets decommitted by M1r.4).</summary>
     public static (int attempted, int succeeded, string endpoint) SeedForEndpoint(string endpoint)
     {
+        bool minimal = Environment.GetEnvironmentVariable("SIMPLEGC_MINIMAL_SEED") == "1";
+        if (minimal)
+        {
+            int attM = 0, okM = 0;
+            var (am, om) = SimpleGC.SeedRoutes(MinimalImmortalTypes, SimpleGC.RouteForcePerm);
+            attM += am; okM += om;
+            return (attM, okM, endpoint + "[minimal]");
+        }
+
         Type[] endpointTypes = endpoint switch
         {
             "fortunes" => FortunesEndpointTypes,
@@ -1118,6 +1161,16 @@ internal static class Driver
                     ulong returned = SimpleGCInterop.RequestDecommitMarkSweep(0);
                     SimpleGCInterop.GetMemoryPressure(&mp);
                     Console.WriteLine($"  decommit  : returned {returned / 1024.0 / 1024.0,8:F1} MB to OS  (msCommitted {before / 1024.0 / 1024.0:F1} -> {mp.MsCommitted / 1024.0 / 1024.0:F1} MB)");
+
+                    // M1r.4: page-granular freelist decommit. Returns
+                    // bytes whose interior pages were unmapped from the
+                    // process. Decreases MsCommitted (M1r.2 reporting now
+                    // subtracts active decommitted pages).
+                    ulong flBefore = mp.MsCommitted;
+                    ulong flReturned = SimpleGCInterop.RequestFreelistDecommit(0);
+                    ulong flTotal = SimpleGCInterop.GetFreelistDecommitTotal();
+                    SimpleGCInterop.GetMemoryPressure(&mp);
+                    Console.WriteLine($"  freelist  : returned {flReturned / 1024.0 / 1024.0,8:F1} MB to OS  (msCommitted {flBefore / 1024.0 / 1024.0:F1} -> {mp.MsCommitted / 1024.0 / 1024.0:F1} MB; freelist now {mp.MsFreelist / 1024.0 / 1024.0:F1} MB; cumulative slot bytes retired {flTotal / 1024.0 / 1024.0:F1} MB)");
                 }
             }
         }
@@ -1374,6 +1427,7 @@ internal static class Program
                 int polls     = adaptive.Polls;
                 ulong collectsObserved = adaptive.CollectsObserved;
                 ulong bytesDecommitted = adaptive.BytesDecommittedTotal;
+                ulong bytesFlDecommitted = adaptive.BytesFreelistDecommittedTotal;
                 MemoryPressure mp      = adaptive.LastPressure;
                 LastCollect    lc      = adaptive.LastCollect;
                 adaptive.Dispose();
@@ -1393,7 +1447,7 @@ internal static class Program
                 {
                     Console.WriteLine($"  policy saw     : lastCollect id={lc.CollectId} pause={lc.TotalUs}us  freed={lc.BytesFreed / 1024.0 / 1024.0:F1}MB live={lc.BytesLiveAfter / 1024.0 / 1024.0:F1}MB");
                 }
-                Console.WriteLine($"  policy decommit: collects={collectsObserved} returned={bytesDecommitted / 1024.0 / 1024.0:F1}MB to OS");
+                Console.WriteLine($"  policy decommit: collects={collectsObserved} trail={bytesDecommitted / 1024.0 / 1024.0:F1}MB freelist={bytesFlDecommitted / 1024.0 / 1024.0:F1}MB to OS");
             }
 
             if (observePolicy)

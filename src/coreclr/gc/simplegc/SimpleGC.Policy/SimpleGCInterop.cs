@@ -157,6 +157,27 @@ public static class SimpleGCInterop
     /// re-commit.</summary>
     [DllImport(Lib, EntryPoint = "simplegc_request_decommit_marksweep")]
     public static extern ulong RequestDecommitMarkSweep(ulong hintBytes);
+
+    /// <summary>M1r.4: ask the substrate to VirtualDecommit interior
+    /// pages of MS freelist slots (slots whose interior contains at
+    /// least one whole 4 KB page strictly between the slot's filler
+    /// header and the next object's header). Each affected slot is
+    /// unlinked from the freelist; its filler header stays as a
+    /// parseable object so the linear walker still works. Pass <c>0</c>
+    /// for "decommit all eligible slots"; pass a non-zero hint to cap
+    /// the total bytes returned (page-aligned; may end up under the
+    /// hint depending on slot layout). Returns bytes actually
+    /// decommitted.</summary>
+    [DllImport(Lib, EntryPoint = "simplegc_request_freelist_decommit")]
+    public static extern ulong RequestFreelistDecommit(ulong hintBytes);
+
+    /// <summary>M1r.4: cumulative bytes that have been unlinked from the
+    /// MS freelist via <see cref="RequestFreelistDecommit"/>. This counts
+    /// the FULL slot size of each freed slot (including the 1-page
+    /// committed prefix kept for the filler header), not just the
+    /// literally-decommitted page bytes.</summary>
+    [DllImport(Lib, EntryPoint = "simplegc_get_freelist_decommit_total")]
+    public static extern ulong GetFreelistDecommitTotal();
 }
 
 /// <summary>Mirror of the native <c>SimpleGCMarkSweepStats</c> ABI struct

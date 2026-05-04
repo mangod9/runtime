@@ -127,6 +127,7 @@ public sealed class AdaptivePolicy : IDisposable
     private ulong          _lastSeenCollectId;
     private ulong          _decommitsObserved;     // # of new-collect events seen
     private ulong          _bytesDecommittedTotal; // sum of RequestDecommit returns
+    private ulong          _bytesFreelistDecommittedTotal; // M1r.4: sum of RequestFreelistDecommit returns
 
     /// <summary>Number of MTs the policy has promoted so far.</summary>
     public int DecisionsMade => Volatile.Read(ref _decisionsMade);
@@ -157,6 +158,15 @@ public sealed class AdaptivePolicy : IDisposable
     /// slack is rare. The loop is still exercised — Phase B (page-granular
     /// freelist decommit) is what will unlock real reclaims.</summary>
     public ulong BytesDecommittedTotal => Volatile.Read(ref _bytesDecommittedTotal);
+
+    /// <summary>M1r.4: cumulative bytes returned to the OS by the policy's
+    /// post-collect <see cref="SimpleGCInterop.RequestFreelistDecommit"/>
+    /// calls. Counts the FULL slot size of each freed slot (header
+    /// committed prefix included), which is the right number for
+    /// "how much freelist capacity has been retired" rather than
+    /// "literally how many bytes left RAM" — the latter is one page
+    /// less per slot.</summary>
+    public ulong BytesFreelistDecommittedTotal => Volatile.Read(ref _bytesFreelistDecommittedTotal);
 
     /// <summary>Start the configured policy. Throws if another instance
     /// is already running (the substrate has only one callback slot).</summary>
@@ -357,6 +367,18 @@ public sealed class AdaptivePolicy : IDisposable
                     if (returned != 0)
                     {
                         Interlocked.Add(ref _bytesDecommittedTotal, returned);
+                    }
+
+                    // M1r.4: ask the substrate to also walk the freelist
+                    // and decommit interior pages of slots that have any
+                    // whole-page interior. Pre-M1r.4 this would have been
+                    // a no-op; under M1r.4 the typical Fortunes pattern
+                    // (~28 MB freelist with 99% interior dead bytes)
+                    // returns most of it.
+                    ulong fl = SimpleGCInterop.RequestFreelistDecommit(0);
+                    if (fl != 0)
+                    {
+                        Interlocked.Add(ref _bytesFreelistDecommittedTotal, fl);
                     }
                 }
             }

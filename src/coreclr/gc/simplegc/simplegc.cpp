@@ -296,7 +296,35 @@ namespace
         std::atomic<uint64_t> n_collections{0};
         std::atomic<uint64_t> n_objects_allocated{0};
         std::atomic<uint64_t> n_objects_swept{0};
+
+        // M1r.4: page-decommit metadata. One bit per 4 KB page in
+        // [start_obj, end). Bit set => page has been VirtualDecommit'ed
+        // via simplegc_request_freelist_decommit and is currently NOT
+        // backed by physical memory. Touching it would fault.
+        //
+        // Sized for kMarkSweepSize / kMsPageSize bits = 65536 bits =
+        // 8192 bytes. Static array; no allocation.
+        uint8_t  decommit_pgmap[256 * 1024 * 1024 / 4096 / 8] = {};
+
+        // Number of bits currently set in decommit_pgmap. Subtracted
+        // from (committed - start_obj) when reporting MsCommitted so
+        // the M1r.2 ABI reflects actually-committed bytes (not the
+        // address-space high-water mark).
+        std::atomic<uint64_t> pages_decommitted_active{0};
+
+        // Cumulative bytes returned to OS by request_freelist_decommit.
+        // Counts the FULL slot size that was unlinked (including the
+        // 1-page committed prefix, which is "lost capacity" even though
+        // not literally decommitted).
+        std::atomic<uint64_t> bytes_freelist_decommitted_total{0};
     };
+
+    // Page-decommit constants. Kept outside the struct because
+    // kMarkSweepSize is in the enclosing namespace and constexpr
+    // forward-references in struct member initialisers are awkward.
+    constexpr size_t kMsPageSize        = 4096;
+    constexpr size_t kMsPageBitmapBytes = kMarkSweepSize / kMsPageSize / 8;
+    static_assert(kMsPageBitmapBytes == 8192, "MS decommit_pgmap sized to kMarkSweepSize");
 
     constexpr size_t kMarkBitGranularity = 8; // 1 bit per 8 bytes of heap
 
@@ -1527,6 +1555,51 @@ static inline size_t ms_free_object_min_size()
     return ms_free_object_base_size();
 }
 
+// M1r.4 page-decommit bitmap helpers. The bitmap is owned by
+// g_marksweep.decommit_pgmap (8 KB, 1 bit per 4 KB page in
+// [start_obj, end)). Bit set => page is currently NOT backed by physical
+// memory; touching it would fault. All callers must hold g_marksweep.lock.
+//
+// Caller must ensure p is in [start_obj, end). A sentinel index for
+// pointers strictly outside that range is undefined.
+static inline size_t ms_pg_index(uint8_t* p)
+{
+    return (size_t)(p - g_marksweep.start_obj) / kMsPageSize;
+}
+
+static inline bool ms_pg_is_decommitted(size_t pg)
+{
+    return (g_marksweep.decommit_pgmap[pg >> 3] >> (pg & 7)) & 1u;
+}
+
+static inline void ms_pg_set_decommitted(size_t pg)
+{
+    g_marksweep.decommit_pgmap[pg >> 3] = (uint8_t)(
+        g_marksweep.decommit_pgmap[pg >> 3] | (uint8_t)(1u << (pg & 7)));
+}
+
+static inline void ms_pg_clear_decommitted(size_t pg)
+{
+    g_marksweep.decommit_pgmap[pg >> 3] = (uint8_t)(
+        g_marksweep.decommit_pgmap[pg >> 3] & (uint8_t)~(1u << (pg & 7)));
+}
+
+// True if any 4 KB page touching [lo, hi) has its decommit bit set.
+// Used by ms_freelist_push to skip linking slots whose interior would
+// fault on the allocator's slow-path memset / next-pointer write.
+static inline bool ms_pg_any_decommitted_in_range(uint8_t* lo, uint8_t* hi)
+{
+    if (lo >= hi) return false;
+    size_t lo_pg = ms_pg_index(lo);
+    size_t hi_pg = ms_pg_index(hi - 1) + 1;
+    for (size_t pg = lo_pg; pg < hi_pg; ++pg)
+    {
+        if (ms_pg_is_decommitted(pg))
+            return true;
+    }
+    return false;
+}
+
 // Write a g_gc_pFreeObjectMethodTable header at p describing a slot of `size`
 // bytes total (including the header). Caller must guarantee size >=
 // ms_free_object_min_size(). Does NOT touch the freelist.
@@ -1557,9 +1630,24 @@ static inline uint8_t*& ms_freelist_next(uint8_t* p)
 
 // Push a free slot onto the head of the region's freelist. Caller holds
 // g_marksweep.lock.
+//
+// M1r.4: if any 4 KB page in [p, p+size) is currently decommitted (per
+// the decommit_pgmap), do NOT link the slot. Its filler header at p
+// stays intact so the linear walker (ms_build_object_start_index,
+// ms_sweep_locked) keeps treating the run as a parseable filler object,
+// but ms_freelist_take never sees it — so the allocator never touches
+// the decommitted interior. The slot's bytes are accounted in
+// bytes_freelist_decommitted_total (set at decommit time), not in
+// bytes_freelist (which only counts allocatable capacity).
 static void ms_freelist_push(uint8_t* p, size_t size)
 {
     ms_set_free_obj(p, size);
+    if (ms_pg_any_decommitted_in_range(p, p + size))
+    {
+        // Stranded: parseable but not allocatable. Bytes already
+        // counted in bytes_freelist_decommitted_total when decommitted.
+        return;
+    }
     if (size >= 24)
     {
         ms_freelist_next(p) = g_marksweep.free_head;
@@ -2266,10 +2354,46 @@ namespace
                 // overlapping the rewound region.
                 if (q == end)
                 {
+                    // M1r.4: any pages in [p, end) we previously
+                    // VirtualDecommit'ed via simplegc_request_freelist_decommit
+                    // must be recommitted before the memset below — otherwise
+                    // the zero-fill faults. Iterate every page touching [p, end);
+                    // recommit any whose bitmap bit is set; clear the bits.
+                    {
+                        uintptr_t p_addr = (uintptr_t)p;
+                        uintptr_t e_addr = (uintptr_t)end;
+                        uintptr_t pg_lo = p_addr & ~(uintptr_t)(kMsPageSize - 1);
+                        uintptr_t pg_hi = (e_addr + kMsPageSize - 1) &
+                                          ~(uintptr_t)(kMsPageSize - 1);
+                        for (uintptr_t pg = pg_lo; pg < pg_hi; pg += kMsPageSize)
+                        {
+                            size_t pg_idx = (size_t)((pg - (uintptr_t)g_marksweep.start_obj) /
+                                                     kMsPageSize);
+                            if (ms_pg_is_decommitted(pg_idx))
+                            {
+                                if (GCToOSInterface::VirtualCommit((void*)pg, kMsPageSize))
+                                {
+                                    ms_pg_clear_decommitted(pg_idx);
+                                    g_marksweep.pages_decommitted_active.fetch_sub(
+                                        1, std::memory_order_relaxed);
+                                }
+                                else
+                                {
+                                    LOG1("sweep bump-rewind: VirtualCommit(%p, %zu) failed; "
+                                         "skipping rewind to avoid AV", (void*)pg, kMsPageSize);
+                                    goto skip_bump_rewind;
+                                }
+                            }
+                        }
+                    }
                     memset(p, 0, run);
                     g_marksweep.bump = p;
                     g_marksweep.bytes_bump_rewound.fetch_add(run, std::memory_order_relaxed);
                     break;
+                skip_bump_rewind:
+                    // VirtualCommit failed; fall through to push the run as a
+                    // (possibly stranded) freelist filler instead.
+                    ;
                 }
                 if (run >= ms_free_object_min_size())
                 {
@@ -4214,7 +4338,15 @@ simplegc_get_memory_pressure(SimpleGCMemoryPressure* out)
     {
         std::lock_guard<std::mutex> guard(g_marksweep.lock);
         out->ms_used      = (uint64_t)(g_marksweep.bump      - g_marksweep.start_obj);
-        out->ms_committed = (uint64_t)(g_marksweep.committed - g_marksweep.start_obj);
+        // M1r.4: subtract pages we VirtualDecommit'ed via the freelist
+        // primitive so MsCommitted reflects true OS-backed bytes (not
+        // the [start_obj, committed) address-space high-water mark).
+        uint64_t bytes_committed_raw = (uint64_t)(g_marksweep.committed - g_marksweep.start_obj);
+        uint64_t decommitted_active  = g_marksweep.pages_decommitted_active.load(std::memory_order_relaxed)
+                                     * kMsPageSize;
+        out->ms_committed = (decommitted_active <= bytes_committed_raw)
+                          ? (bytes_committed_raw - decommitted_active)
+                          : 0;
     }
     else
     {
@@ -4295,6 +4427,118 @@ simplegc_request_decommit_marksweep(uint64_t hint_bytes)
     LOG1("simplegc_request_decommit_marksweep: returned %llu bytes (newCommitted=%p)",
          (unsigned long long)toDecommit, g_marksweep.committed);
     return toDecommit;
+}
+
+// M1r.4: page-granular freelist decommit.
+//
+// Walks the MS freelist; for each slot whose interior contains at least
+// one full 4 KB page strictly between the slot's filler header (kept
+// committed at p) and the next object's header (kept committed at
+// p+slot_size), VirtualDecommit'es those interior pages and unlinks
+// the slot from the freelist (the filler header stays in place so the
+// linear walker still sees a parseable object).
+//
+// Slot accounting:
+//   - bytes_freelist          -= slot_size (no longer allocatable).
+//   - bytes_freelist_decommitted_total += slot_size (cumulative ledger).
+//   - pages_decommitted_active += pages_decommitted (for MsCommitted reporting).
+//
+// hint_bytes = 0 means "decommit as many pages as we find"; > 0 caps the
+// total returned bytes (rounded down to page granularity, may end up
+// short of the hint).
+//
+// Safety: held under g_marksweep.lock; allocator paths don't race.
+// Sweep bump-rewind has its own recommit path (see ms_sweep_locked) so
+// future sweeps that rewind through these regions don't fault.
+GC_EXPORT
+uint64_t LOCALGC_CALLCONV
+simplegc_request_freelist_decommit(uint64_t hint_bytes)
+{
+    if (g_marksweep.start_obj == nullptr) return 0;
+    if (g_marksweep.free_head == nullptr) return 0;
+
+    std::lock_guard<std::mutex> guard(g_marksweep.lock);
+
+    uint64_t total_decommitted = 0;
+    uint8_t** slot_link = &g_marksweep.free_head;
+    while (*slot_link != nullptr)
+    {
+        uint8_t* p = *slot_link;
+        size_t   s = ms_read_free_obj_size(p);
+        // All linked slots have size >= 24 by ms_freelist_push contract.
+        uint8_t* next_slot = ms_freelist_next(p);
+
+        // Page-aligned interior of the slot:
+        //   lo = first page boundary STRICTLY after p (so the page
+        //        containing the filler header stays committed)
+        //   hi = last page boundary AT OR BEFORE p+s (so the page
+        //        containing the next object's header at p+s stays out)
+        uintptr_t p_start = (uintptr_t)p;
+        uintptr_t p_end   = p_start + s;
+        uintptr_t lo      = (p_start & ~(uintptr_t)(kMsPageSize - 1)) + kMsPageSize;
+        uintptr_t hi      = p_end & ~(uintptr_t)(kMsPageSize - 1);
+
+        if (hint_bytes != 0 && total_decommitted >= hint_bytes) break;
+        if (hint_bytes != 0 && lo < hi)
+        {
+            uint64_t remaining = hint_bytes - total_decommitted;
+            uint64_t avail_here = (uint64_t)(hi - lo);
+            if (avail_here > remaining)
+            {
+                hi = lo + (uintptr_t)(remaining & ~((uint64_t)kMsPageSize - 1));
+            }
+        }
+
+        bool unlinked = false;
+        if (lo < hi)
+        {
+            size_t   bytes = (size_t)(hi - lo);
+            uint8_t* addr  = (uint8_t*)lo;
+            if (GCToOSInterface::VirtualDecommit(addr, bytes))
+            {
+                size_t lo_pg = ((uintptr_t)addr - (uintptr_t)g_marksweep.start_obj) / kMsPageSize;
+                size_t n_pgs = bytes / kMsPageSize;
+                for (size_t i = 0; i < n_pgs; ++i)
+                    ms_pg_set_decommitted(lo_pg + i);
+                g_marksweep.pages_decommitted_active.fetch_add(n_pgs, std::memory_order_relaxed);
+
+                // Unlink: remove the slot from the freelist; its header
+                // stays in place as a parseable filler.
+                *slot_link = next_slot;
+                g_marksweep.bytes_freelist.fetch_sub(s, std::memory_order_relaxed);
+                g_marksweep.bytes_freelist_decommitted_total.fetch_add(
+                    s, std::memory_order_relaxed);
+
+                total_decommitted += bytes;
+                unlinked = true;
+            }
+            else
+            {
+                LOG1("simplegc_request_freelist_decommit: VirtualDecommit(%p, %zu) failed",
+                     addr, bytes);
+            }
+        }
+
+        if (!unlinked)
+        {
+            slot_link = &ms_freelist_next(p);
+        }
+    }
+
+    LOG1("simplegc_request_freelist_decommit: returned %llu bytes (free_head now %p)",
+         (unsigned long long)total_decommitted, g_marksweep.free_head);
+    return total_decommitted;
+}
+
+// M1r.4: cumulative bytes that have been unlinked from the MS freelist
+// via simplegc_request_freelist_decommit. Note this is the SLOT size of
+// each freed slot (including the 1-page committed prefix that we keep
+// for the filler header), not just the literally-decommitted page bytes.
+GC_EXPORT
+uint64_t LOCALGC_CALLCONV
+simplegc_get_freelist_decommit_total()
+{
+    return g_marksweep.bytes_freelist_decommitted_total.load(std::memory_order_relaxed);
 }
 
 
