@@ -683,6 +683,11 @@ internal static class Driver
 
     public static async Task<int> RunAsync(string endpoint, int totalRequests, int concurrency)
     {
+        // GC trace listener: subscribes to runtime ETW GC events to capture
+        // per-pause (gen, duration). Reset after warmup so init/JIT/lazy-load
+        // collects don't pollute the steady-state stats.
+        var gcTrace = new GcTraceListener();
+
         // One HttpClient per worker; pre-create to avoid per-iter handler init
         var clients = new HttpClient[concurrency];
         for (int i = 0; i < concurrency; i++)
@@ -722,6 +727,10 @@ internal static class Driver
         }
         Console.WriteLine($"driver: warmup done (failures={failures}).");
         failures = 0;
+
+        // Reset the GC pause record so warmup pauses don't bias the steady-
+        // state breakdown.
+        gcTrace.Reset();
 
         if (SimpleGC.ArenaConfigured)
         {
@@ -809,6 +818,28 @@ internal static class Driver
         p.Refresh();
         Console.WriteLine($"  workSet  : {p.WorkingSet64 / 1024.0 / 1024.0,10:F1} MB");
         Console.WriteLine($"  peakWS   : {p.PeakWorkingSet64 / 1024.0 / 1024.0,10:F1} MB");
+
+        // GC pause breakdown by generation. For default WKS/Server this is
+        // gold (gen0 vs gen1 vs gen2 distribution). For simplegc all pauses
+        // bucket as gen=unk because simplegc doesn't fire GCStart_V2.
+        Console.WriteLine();
+        var pauseRecords = gcTrace.Snapshot();
+        GcTraceListener.PrintSummary(pauseRecords, totalSw.Elapsed.TotalMilliseconds);
+
+        // Optional CSV dump for offline analysis.
+        string? csvPath = Environment.GetEnvironmentVariable("KESTREL_BENCH_GC_TRACE_CSV");
+        if (!string.IsNullOrEmpty(csvPath))
+        {
+            try
+            {
+                GcTraceListener.WriteCsv(pauseRecords, csvPath);
+                Console.WriteLine($"  gc trace csv written to {csvPath}");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"  (failed to write gc trace csv: {ex.Message})");
+            }
+        }
 
         if (SimpleGC.IsLoaded)
         {
