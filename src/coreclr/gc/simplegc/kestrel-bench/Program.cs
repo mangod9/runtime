@@ -381,6 +381,13 @@ internal static class ManagedSeed
 // Domain model + handler
 // ---------------------------------------------------------------------------
 
+// M1r.5 — declarative GC hints. Each annotated type expresses its
+// intended lifetime so simplegc's HintScanner can route allocations to
+// the right substrate region without a separate hand-curated seed list.
+// An LLM generating application code can produce annotations like these
+// directly from its understanding of the workload.
+
+[SimpleGCHint(Lifetime.Transient)]
 internal sealed class Item
 {
     public int Id { get; set; }
@@ -389,6 +396,7 @@ internal sealed class Item
     public string[] Tags { get; set; } = Array.Empty<string>();
 }
 
+[SimpleGCHint(Lifetime.Transient)]
 internal sealed class ItemsResponse
 {
     public int RequestId { get; set; }
@@ -402,6 +410,11 @@ internal sealed class ItemsResponse
 // a sorted result array, projected ProductSummary[], JSON serialization
 // buffers. Estimate ~30-60 KB per request depending on match count.
 
+// Catalog Product instances are built once at startup and live for the
+// entire process — Permanent. ProductSummary and SearchResponse are
+// built per-request and dropped at end of pipe write — Transient.
+
+[SimpleGCHint(Lifetime.Permanent)]
 internal sealed class Product
 {
     public int Id { get; set; }
@@ -413,6 +426,7 @@ internal sealed class Product
     public string[] Tags { get; set; } = Array.Empty<string>();
 }
 
+[SimpleGCHint(Lifetime.Transient)]
 internal sealed class ProductSummary
 {
     public int Id { get; set; }
@@ -422,6 +436,7 @@ internal sealed class ProductSummary
     public int MatchScore { get; set; }
 }
 
+[SimpleGCHint(Lifetime.Transient)]
 internal sealed class SearchResponse
 {
     public string Query { get; set; } = "";
@@ -451,6 +466,15 @@ internal partial class AppJsonContext : JsonSerializerContext { }
 // surfaced the M1i.2 alignment bug.
 // ---------------------------------------------------------------------------
 
+// Fortune instances split by lifetime: the catalog rows in Fortunes.All
+// are built once at startup; per-request rendering allocates a fresh
+// Fortune[] and ~12 Fortune objects that die at end of pipe write. The
+// substrate routes both into the same region (per-MT routing is
+// MT-granular, not site-granular), so we annotate as Transient: the
+// catalog rows leak into MS but are immortal so survive every collect
+// cheaply, and the request churn dominates the steady-state pattern.
+
+[SimpleGCHint(Lifetime.Transient)]
 internal sealed class Fortune
 {
     public int Id { get; set; }
@@ -1412,6 +1436,20 @@ internal static class Program
                 SimpleGC.EnableAutoRouteDefault(true);
                 var (att, ok, ep) = ManagedSeed.SeedForEndpoint(endpoint);
                 Console.WriteLine($"  managed seed    : {ok}/{att} types pinned to perm for ep={ep} (auto-routing ON)");
+            }
+
+            // M1r.5 — declarative GC hints. When SIMPLEGC_USE_HINT_SCANNER=1
+            // is set, walk loaded assemblies for [SimpleGCHint] annotations
+            // and apply each type's hint via simplegc_set_route. This is
+            // the "policy as code" complement to the seed list above:
+            // the seed handles BCL types we can't annotate (string,
+            // byte[], etc.), and HintScanner handles user/app types whose
+            // declarations carry their lifetime intent inline.
+            string? hintEnv = Environment.GetEnvironmentVariable("SIMPLEGC_USE_HINT_SCANNER");
+            if (!string.IsNullOrEmpty(hintEnv) && hintEnv != "0")
+            {
+                int hintsApplied = HintScanner.Start();
+                Console.WriteLine($"  hint scanner    : {hintsApplied} hints applied (skipped open-generic={HintScanner.SkippedOpenGeneric})");
             }
         }
 
