@@ -1372,8 +1372,28 @@ internal static class Program
                 // quiescence) and emit final decision count.
                 int decisions = adaptive.DecisionsMade;
                 int polls     = adaptive.Polls;
+                ulong collectsObserved = adaptive.CollectsObserved;
+                ulong bytesDecommitted = adaptive.BytesDecommittedTotal;
+                MemoryPressure mp      = adaptive.LastPressure;
+                LastCollect    lc      = adaptive.LastCollect;
                 adaptive.Dispose();
                 Console.WriteLine($"  adaptive policy : stopped (decisions={decisions} polls={polls})");
+
+                // M1r.3: surface what AdaptivePolicy saw via the M1r.2 ABI.
+                // This is the same data that drove its in-loop decisions —
+                // surfacing it at end-of-run lets us correlate decisions
+                // with substrate state, and proves the callback consumed
+                // the new context rather than just the kestrel-bench
+                // smoke print at end of run.
+                if (mp.AbiVersion == MemoryPressure.SupportedAbiVersion)
+                {
+                    Console.WriteLine($"  policy saw     : MS used {mp.MsUsed / 1024.0 / 1024.0:F1}MB / commit {mp.MsCommitted / 1024.0 / 1024.0:F1}MB / freelist {mp.MsFreelist / 1024.0 / 1024.0:F1}MB / live {mp.MsLiveAfter / 1024.0 / 1024.0:F1}MB");
+                }
+                if (lc.AbiVersion == LastCollect.SupportedAbiVersion && lc.CollectId > 0)
+                {
+                    Console.WriteLine($"  policy saw     : lastCollect id={lc.CollectId} pause={lc.TotalUs}us  freed={lc.BytesFreed / 1024.0 / 1024.0:F1}MB live={lc.BytesLiveAfter / 1024.0 / 1024.0:F1}MB");
+                }
+                Console.WriteLine($"  policy decommit: collects={collectsObserved} returned={bytesDecommitted / 1024.0 / 1024.0:F1}MB to OS");
             }
 
             if (observePolicy)

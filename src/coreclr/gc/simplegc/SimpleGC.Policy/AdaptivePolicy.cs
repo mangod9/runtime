@@ -117,6 +117,17 @@ public sealed class AdaptivePolicy : IDisposable
     private int _disposed;
     private int _selfStopped;
 
+    // M1r.3: substrate-context observation. Updated on every dispatcher
+    // tick from the M1r.2 ABI getters; readable by the host for
+    // end-of-run telemetry. Doubles as the trigger for our decommit
+    // calls — when collect_id ticks past _lastSeenCollectId, a new
+    // collect just finished and we can poke RequestDecommitMarkSweep.
+    private MemoryPressure _lastPressure;
+    private LastCollect    _lastCollect;
+    private ulong          _lastSeenCollectId;
+    private ulong          _decommitsObserved;     // # of new-collect events seen
+    private ulong          _bytesDecommittedTotal; // sum of RequestDecommit returns
+
     /// <summary>Number of MTs the policy has promoted so far.</summary>
     public int DecisionsMade => Volatile.Read(ref _decisionsMade);
 
@@ -127,6 +138,25 @@ public sealed class AdaptivePolicy : IDisposable
     /// <summary>True once the callback has self-unregistered (or
     /// <see cref="Dispose"/> has run).</summary>
     public bool HasStopped => Volatile.Read(ref _selfStopped) != 0 || Volatile.Read(ref _disposed) != 0;
+
+    /// <summary>M1r.3: most-recent <see cref="MemoryPressure"/> snapshot
+    /// the policy observed (zero-initialized until the first tick).</summary>
+    public MemoryPressure LastPressure { get { lock (s_lock) return _lastPressure; } }
+
+    /// <summary>M1r.3: most-recent <see cref="LastCollect"/> snapshot.</summary>
+    public LastCollect LastCollect { get { lock (s_lock) return _lastCollect; } }
+
+    /// <summary>M1r.3: number of distinct mark-sweep collects the policy
+    /// has observed via the M1r.2 LastCollect ABI.</summary>
+    public ulong CollectsObserved => Volatile.Read(ref _decommitsObserved);
+
+    /// <summary>M1r.3: cumulative bytes returned to the OS by the policy's
+    /// post-collect <see cref="SimpleGCInterop.RequestDecommitMarkSweep"/>
+    /// calls. May be 0 even after many collects: under the M1m sub-arena
+    /// allocator the bump pointer tracks committed tightly, so trailing
+    /// slack is rare. The loop is still exercised — Phase B (page-granular
+    /// freelist decommit) is what will unlock real reclaims.</summary>
+    public ulong BytesDecommittedTotal => Volatile.Read(ref _bytesDecommittedTotal);
 
     /// <summary>Start the configured policy. Throws if another instance
     /// is already running (the substrate has only one callback slot).</summary>
@@ -241,6 +271,11 @@ public sealed class AdaptivePolicy : IDisposable
                 }
             }
 
+            // M1r.3: read substrate context via the M1r.2 ABI. The
+            // getters are pure reads (no STW) and run on the dispatcher
+            // thread, so they're safe to call every tick.
+            ObserveSubstrate();
+
             int totalPolls = Interlocked.Increment(ref _polls);
             if (newDecisions == 0)
             {
@@ -269,6 +304,62 @@ public sealed class AdaptivePolicy : IDisposable
         finally
         {
             SimpleGCInterop.SetThreadRoute(saved);
+        }
+    }
+
+    /// <summary>
+    /// M1r.3: observe substrate state via the M1r.2 ABI and act on it.
+    /// </summary>
+    /// <remarks>
+    /// <para>The <see cref="MemoryPressure"/> snapshot is cached for the
+    /// host to read; future revisions can use it to gate promotion
+    /// (e.g. stop promoting when <c>PermUsed &gt; 0.8 * cap</c>).</para>
+    /// <para>The <see cref="LastCollect"/> snapshot is the trigger for
+    /// our post-collect cleanup: when <see cref="LastCollect.CollectId"/>
+    /// has advanced past <see cref="_lastSeenCollectId"/>, a new
+    /// mark-sweep cycle just completed. Sweep already does
+    /// trailing-dead-zone bump-rewind (see ms_sweep_locked, M1l). The
+    /// only thing that can shrink resident set further today is asking
+    /// the OS to return committed-but-unused pages above bump.</para>
+    /// <para>Under M1m sub-arenas the bump pointer tracks committed
+    /// tightly, so the call usually returns 0 — that's expected. The
+    /// loop is still exercised; the value of going through it is
+    /// twofold: (1) it proves the M1r.2 ABI works in a real consumer
+    /// (the AdaptivePolicy callback, not just the kestrel-bench smoke),
+    /// and (2) when sweep produces a substantial trailing dead run
+    /// (workload with bursty, short-lived MS objects) the call returns
+    /// real bytes and peakWS shrinks.</para>
+    /// </remarks>
+    private void ObserveSubstrate()
+    {
+        unsafe
+        {
+            MemoryPressure mp = default;
+            LastCollect    lc = default;
+            uint mpV = SimpleGCInterop.GetMemoryPressure(&mp);
+            uint lcV = SimpleGCInterop.GetLastCollect(&lc);
+
+            if (mpV == MemoryPressure.SupportedAbiVersion)
+            {
+                lock (s_lock) _lastPressure = mp;
+            }
+
+            if (lcV == LastCollect.SupportedAbiVersion)
+            {
+                lock (s_lock) _lastCollect = lc;
+
+                if (lc.CollectId > _lastSeenCollectId)
+                {
+                    _lastSeenCollectId = lc.CollectId;
+                    Interlocked.Increment(ref _decommitsObserved);
+
+                    ulong returned = SimpleGCInterop.RequestDecommitMarkSweep(0);
+                    if (returned != 0)
+                    {
+                        Interlocked.Add(ref _bytesDecommittedTotal, returned);
+                    }
+                }
+            }
         }
     }
 
