@@ -371,3 +371,7 @@ uint64_t GCToEEInterface::GetThreadOSThreadId(Thread* thread)
 {
     return 0;
 }
+
+void GCToEEInterface::DiagPolicyPostGC()
+{
+}

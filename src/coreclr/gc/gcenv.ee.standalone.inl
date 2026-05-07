@@ -346,4 +346,12 @@ inline uint64_t GCToEEInterface::GetThreadOSThreadId(Thread* thread)
     }
 }
 
+inline void GCToEEInterface::DiagPolicyPostGC()
+{
+    if (g_runtimeSupportedVersion.MajorVersion >= 5)
+    {
+        g_theGCToCLR->DiagPolicyPostGC();
+    }
+}
+
 #endif // __GCTOENV_EE_STANDALONE_INL__

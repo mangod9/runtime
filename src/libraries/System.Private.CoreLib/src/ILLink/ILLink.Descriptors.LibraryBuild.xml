@@ -39,5 +39,17 @@
       <method name="LoadAssemblyAndGetFunctionPointer" />
       <method name="GetFunctionPointer" />
     </type>
+    <!-- Hook 2 GC policy prototype: preserve internal types/methods that are
+         only invoked through the prototype API surface so the trimmer does
+         not strip them. -->
+    <type fullname="System.GC">
+      <method name="RegisterPolicy" />
+      <method name="UnregisterPolicy" />
+      <method name="RunPolicyDispatcherSelfTest" />
+      <method name="RunPolicyDispatcherAllocSelfTest" />
+    </type>
+    <type fullname="System.Runtime.GCPolicy.IGCPolicy" />
+    <type fullname="System.Runtime.GCPolicy.GCCollectionInfo" />
+    <type fullname="System.Runtime.GCPolicy.GCPolicyDispatcher" />
   </assembly>
 </linker>

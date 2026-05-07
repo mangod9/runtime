@@ -235,6 +235,18 @@ extern "C" enable_no_gc_region_callback_status QCALLTYPE GCInterface_EnableNoGCR
 
 extern "C" uint64_t QCALLTYPE GCInterface_GetGenerationBudget(int generation);
 
+// Returns the OS HANDLE of the post-collection notification event used by
+// the managed IGCPolicy dispatcher (System.Runtime.GCPolicy.GCPolicyDispatcher).
+// Lazy-creates the event on first call. Returns 0 on non-Windows or on
+// failure, in which case the dispatcher falls back to polling.
+extern "C" intptr_t QCALLTYPE GCInterface_GetPolicyNotificationHandle();
+
+// Signals the post-collection notification event if it has been created.
+// Called from GCToEEInterface::DiagPolicyPostGC, which fires from
+// gc_heap::do_post_gc at the end of every collection. No-op if no managed
+// policy has registered.
+void SignalPostGCNotificationIfRegistered();
+
 //
 // EnvironmentNative
 //

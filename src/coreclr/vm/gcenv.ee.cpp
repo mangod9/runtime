@@ -1873,3 +1873,9 @@ uint64_t GCToEEInterface::GetThreadOSThreadId(Thread* thread)
 {
     return thread->GetOSThreadId64();
 }
+
+void GCToEEInterface::DiagPolicyPostGC()
+{
+    extern void SignalPostGCNotificationIfRegistered();
+    SignalPostGCNotificationIfRegistered();
+}

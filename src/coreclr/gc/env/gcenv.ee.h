@@ -100,6 +100,8 @@ public:
     static void LogErrorToHost(const char *message);
 
     static uint64_t GetThreadOSThreadId(Thread* thread);
+
+    static void DiagPolicyPostGC();
 };
 
 #endif // __GCENV_EE_H__

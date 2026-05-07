@@ -1721,4 +1721,9 @@ void gc_heap::do_post_gc()
         grow_mark_list();
         mark_list_overflow = false;
     }
+
+    // Wake any registered managed IGCPolicy dispatcher. Last step of
+    // do_post_gc so last_recorded_gc_info is fully populated when the
+    // dispatcher reads GC.GetGCMemoryInfo().
+    GCToEEInterface::DiagPolicyPostGC();
 }

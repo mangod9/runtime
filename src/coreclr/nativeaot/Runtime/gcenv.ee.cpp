@@ -816,4 +816,9 @@ void GCToEEInterface::TriggerClientBridgeProcessing(MarkCrossReferencesArgs* arg
 #endif
 }
 
+void GCToEEInterface::DiagPolicyPostGC()
+{
+    // NativeAOT does not currently support managed IGCPolicy callbacks.
+}
+
 #endif // !DACCESS_COMPILE

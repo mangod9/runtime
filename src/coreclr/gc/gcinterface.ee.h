@@ -468,6 +468,15 @@ public:
 
     virtual
     void TriggerClientBridgeProcessing(MarkCrossReferencesArgs* args) PURE_VIRTUAL
+
+    // Called from the GC after each completed collection (FG and BGC) once
+    // last_recorded_gc_info has been fully updated. Allows the EE to wake any
+    // managed IGCPolicy dispatcher that has registered. Implementations must
+    // be non-blocking and must not allocate, because this can run during STW.
+    // No-op when no policy is registered.
+    // Available only with EE_INTERFACE_MAJOR_VERSION >= 5.
+    virtual
+    void DiagPolicyPostGC() PURE_VIRTUAL
 };
 
 #endif // _GCINTERFACE_EE_H_

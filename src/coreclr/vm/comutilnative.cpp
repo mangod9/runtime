@@ -622,6 +622,100 @@ extern "C" int QCALLTYPE GCInterface_WaitForFullGCComplete(int millisecondsTimeo
     return result;
 }
 
+// ============================================================================
+// IGCPolicy dispatcher signal channel
+//
+// CoreCLR side of the prototype managed IGCPolicy callback mechanism. A
+// global auto-reset CLREventStatic is lazily created when managed code
+// calls GCInterface_GetPolicyNotificationHandle. The GC signals the event
+// at the end of every collection (FG and BGC) via
+// SignalPostGCNotificationIfRegistered, called from
+// GCToEEInterface::DiagPolicyPostGC (vm/gcenv.ee.cpp), which is invoked
+// from gc_heap::do_post_gc (gc/collect.cpp) AFTER last_recorded_gc_info
+// has been fully populated, so the dispatcher reads consistent state.
+//
+// Pay-for-play: when no managed policy registers, the event is never
+// created and the signal is a single VolatileLoad branch.
+//
+// Cross-platform: only Windows exposes a HANDLE that can wrap into a
+// managed SafeWaitHandle/WaitHandle. On Unix the QCall returns 0 and
+// managed dispatcher falls back to polling.
+// ============================================================================
+
+#ifdef HOST_WINDOWS
+namespace
+{
+    enum PolicyEventInitState
+    {
+        PolicyEventInitState_None        = 0,
+        PolicyEventInitState_Initializing = 1,
+        PolicyEventInitState_Ready        = 2,
+        PolicyEventInitState_Failed       = 3,
+    };
+
+    CLREventStatic g_postGCNotificationEvent;
+    Volatile<LONG> g_postGCNotificationEventInitState = PolicyEventInitState_None;
+}
+#endif // HOST_WINDOWS
+
+extern "C" intptr_t QCALLTYPE GCInterface_GetPolicyNotificationHandle()
+{
+    QCALL_CONTRACT;
+
+    intptr_t result = 0;
+
+    BEGIN_QCALL;
+
+#ifdef HOST_WINDOWS
+    LONG state = InterlockedCompareExchange(
+        (LONG*)&g_postGCNotificationEventInitState,
+        PolicyEventInitState_Initializing,
+        PolicyEventInitState_None);
+    if (state == PolicyEventInitState_None)
+    {
+        BOOL created = g_postGCNotificationEvent.CreateAutoEventNoThrow(FALSE);
+        InterlockedExchange(
+            (LONG*)&g_postGCNotificationEventInitState,
+            created ? PolicyEventInitState_Ready : PolicyEventInitState_Failed);
+    }
+    else
+    {
+        // Spin briefly while another thread completes initialization.
+        while (g_postGCNotificationEventInitState.LoadWithoutBarrier() == PolicyEventInitState_Initializing)
+        {
+            YieldProcessor();
+        }
+    }
+
+    if (g_postGCNotificationEventInitState.LoadWithoutBarrier() == PolicyEventInitState_Ready)
+    {
+        result = (intptr_t)g_postGCNotificationEvent.GetOSEvent();
+    }
+#endif // HOST_WINDOWS
+
+    END_QCALL;
+
+    return result;
+}
+
+// Called from GCToEEInterface::DiagPolicyPostGC at the end of every
+// collection. Non-blocking, no allocation, no managed-locks. Safe in STW.
+// No-op until the managed dispatcher first calls GCInterface_GetPolicyNotificationHandle.
+void SignalPostGCNotificationIfRegistered()
+{
+    LIMITED_METHOD_CONTRACT;
+
+#ifdef HOST_WINDOWS
+    if (g_postGCNotificationEventInitState.LoadWithoutBarrier() == PolicyEventInitState_Ready)
+    {
+        // Bypass CLREventBase::Set's checked-build Debug_AllowCallout assert
+        // (do_post_gc runs inside SuspendEE for foreground GCs). SetEvent is
+        // a kernel syscall and is safe under STW.
+        ::SetEvent(g_postGCNotificationEvent.GetOSEvent());
+    }
+#endif // HOST_WINDOWS
+}
+
 /*================================GetGenerationInternal=================================
 **Action: Returns the generation in which args->obj is found.
 **Returns: The generation in which args->obj is found.

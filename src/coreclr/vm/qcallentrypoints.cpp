@@ -352,6 +352,7 @@ static const Entry s_QCall[] =
     DllImportEntry(GCInterface_RefreshMemoryLimit)
     DllImportEntry(GCInterface_EnableNoGCRegionCallback)
     DllImportEntry(GCInterface_GetGenerationBudget)
+    DllImportEntry(GCInterface_GetPolicyNotificationHandle)
     DllImportEntry(GCHandle_InternalAllocWithGCTransition)
     DllImportEntry(GCHandle_InternalFreeWithGCTransition)
 #ifdef FEATURE_JAVAMARSHAL

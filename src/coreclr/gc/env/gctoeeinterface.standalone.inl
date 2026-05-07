@@ -268,5 +268,10 @@ namespace standalone
         {
             return ::GCToEEInterface::GetThreadOSThreadId(thread);
         }
+
+        void DiagPolicyPostGC()
+        {
+            ::GCToEEInterface::DiagPolicyPostGC();
+        }
     };
 }
